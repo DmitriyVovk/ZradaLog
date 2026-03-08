@@ -1,0 +1,347 @@
+  Вот полный план разработки Time Lapse Screen Recorder на Electron:
+Название "ZradaLog", мемное "Зрада" и логгирование.
+Программа позиционируется в основном как рекордер выполенной работы в доказательство.
+
+---
+
+## 1. Стек технологий
+
+| Компонент | Технология | Назначение |
+|-----------|-----------|------------|
+| **Фреймворк** | Electron 28+ | Основа приложения |
+| **UI-фреймворк** | React 18 + TypeScript | Интерфейс |
+| **Стилизация** | Tailwind CSS | Современный дизайн |
+| **Сборка** | Vite | Быстрая компиляция |
+| **Упаковка** | electron-builder | .exe, .dmg, .AppImage |
+| **Захват экрана** | `desktopCapturer` (Electron API) | Выбор источника |
+| **Запись видео** | FFmpeg (бинарники) | Кодирование, time lapse |
+| **Сравнение кадров** | FFmpeg `select=gt(scene\,X)` | Игнорирование похожих |
+| **Хранение настроек** | electron-store | JSON-конфиг |
+| **Горячие клавиши** | electron-localshortcut | Глобальные хоткеи |
+| **Трей** | Electron Tray API | Минимизация в трей |
+
+---
+
+## 2. Архитектура приложения
+
+```
+screen-recorder/
+├── electron/                    # Главный процесс (Node.js)
+│   ├── main.ts                  # Точка входа, создание окна
+│   ├── preload.ts               # Безопасный мост IPC
+│   ├── ipc/                     # Обработчики событий
+│   │   ├── recorder.handlers.ts # Старт/стоп записи
+│   │   ├── config.handlers.ts   # Сохранение/загрузка настроек
+│   │   └── system.handlers.ts   # Диалоги выбора папки
+│   ├── services/
+│   │   ├── FFmpegService.ts     # Обертка над FFmpeg
+│   │   ├── RecorderEngine.ts    # Логика таймера и записи
+│   │   ├── ConfigManager.ts     # Работа с electron-store
+│   │   └── TrayManager.ts       # Иконка в системном трее
+│   └── utils/
+│       ├── paths.ts             # Пути к FFmpeg бинарникам
+│       └── validators.ts        # Проверка настроек
+├── src/                         # Рендер-процесс (React)
+│   ├── components/
+│   │   ├── RecorderControls.tsx # Кнопки старт/стоп/пауза
+│   │   ├── SourceSelector.tsx   # Выбор экрана/окна
+│   │   ├── SettingsPanel.tsx    # Настройки FPS, порога, пути
+│   │   ├── PreviewWindow.tsx    # Превью выбранной области
+│   │   └── StatusBar.tsx        # Индикатор записи, таймер
+│   ├── hooks/
+│   │   ├── useRecorder.ts       # Управление записью
+│   │   ├── useConfig.ts         # Работа с настройками
+│   │   └── useIpc.ts            # Коммуникация с main
+│   ├── store/
+│   │   └── recorderStore.ts     # Zustand/Redux состояние
+│   ├── types/
+│   │   └── index.ts             # TypeScript интерфейсы
+│   └── App.tsx                  # Корневой компонент
+├── resources/                   # Статические ресурсы
+│   ├── ffmpeg/
+│   │   ├── win-x64/             # ffmpeg.exe для Windows
+│   │   ├── mac-arm64/           # ffmpeg для Apple Silicon
+│   │   ├── mac-x64/             # ffmpeg для Intel Mac
+│   │   └── linux-x64/           # ffmpeg для Linux
+│   ├── icons/
+│   │   ├── tray-icon.png
+│   │   ├── app-icon.ico
+│   │   └── app-icon.icns
+│   └── sounds/                  # Звуки старт/стоп (опционально)
+├── build/                       # Конфиги electron-builder
+└── package.json
+```
+
+---
+
+## 3. Функциональные модули
+
+### 3.1 Главное окно (Main Process)
+
+**Функции:**
+- Создание `BrowserWindow` с размерами 900×600
+- Загрузка dev-server (dev) или index.html (prod)
+- Инициализация Tray, глобальных хоткеев
+- Управление жизненным циклом приложения
+
+**Особенности:**
+- `nodeIntegration: false`, `contextIsolation: true` (безопасность)
+- Preload-скрипт как единственный мост между main и renderer
+
+### 3.2 IPC Коммуникация (Preload → Main)
+
+| Канал (channel) | Направление | Данные |
+|-----------------|-------------|--------|
+| `recorder:start` | Renderer → Main | `{ sourceId, fps, threshold, outputPath }` |
+| `recorder:stop` | Renderer → Main | — |
+| `recorder:status` | Main → Renderer | `{ isRecording, duration, frameCount }` |
+| `config:get` | Renderer → Main | `key` |
+| `config:set` | Renderer → Main | `{ key, value }` |
+| `dialog:selectFolder` | Renderer → Main | — |
+| `sources:get` | Renderer → Main | — |
+| `sources:return` | Main → Renderer | `[{ id, name, thumbnail }]` |
+
+### 3.3 Движок записи (RecorderEngine)
+
+**Алгоритм:**
+
+```
+1. Получение sourceId от renderer
+2. Запуск интервального таймера (1000 / fps ms)
+3. Каждый тик:
+   a. Получение кадра через desktopCapturer (или скриншот FFmpeg)
+   b. Передача в FFmpeg через stdin pipe ИЛИ
+   c. Сохранение во временную папку, сборка в конце
+4. При остановке: корректное закрытие FFmpeg, финализация файла
+```
+
+**Режимы записи:**
+
+| Режим | Описание | Когда использовать |
+|-------|----------|------------------|
+| **Direct FFmpeg** | Поток в FFmpeg через pipe | FPS ≥ 1, стабильный поток |
+| **Frame Buffer** | Сохранение PNG → сборка в конце | FPS < 1, сложная обработка |
+| **Scene Detection** | FFmpeg фильтр `select` | Игнорирование похожих кадров |
+
+### 3.4 FFmpeg интеграция (FFmpegService)
+
+**Команды для разных сценариев:**
+
+**Time Lapse (низкий FPS):**
+```bash
+ffmpeg -f image2pipe -vcodec png -r 1 -i - 
+       -c:v libx264 -preset medium -crf 23 
+       -pix_fmt yuv420p output.mp4
+```
+
+**С игнорированием похожих кадров:**
+```bash
+ffmpeg -i input.mp4 
+       -vf "select=gt(scene\,0.1),setpts=N/(25*TB)" 
+       -c:v libx264 output.mp4
+```
+
+**Захват экрана напрямую (Windows):**
+```bash
+ffmpeg -f gdigrab -framerate 0.5 -i desktop 
+       -c:v libx264 -preset fast output.mp4
+```
+
+**API сервиса:**
+```typescript
+class FFmpegService {
+  startRecording(options: RecordingOptions): Promise<void>
+  stopRecording(): Promise<string> // возвращает путь к файлу
+  setFrameRate(fps: number): void
+  setSimilarityThreshold(percent: number): void
+  private spawnProcess(args: string[]): ChildProcess
+}
+```
+
+### 3.5 Управление настройками (ConfigManager)
+
+**Сохраняемые параметры (electron-store):**
+
+```typescript
+interface AppConfig {
+  outputFolder: string;           // последняя выбранная папка
+  filenameTemplate: string;       // "timelapse_{date}_{time}"
+  fps: number;                    // 0.015625 (1/64) до 1
+  ignoreSimilarFrames: boolean;   // включить фильтрацию
+  similarityThreshold: number;    // 0-100%, по умолчанию 5%
+  codec: 'libx264' | 'libx265';   // H.264 или H.265
+  crf: number;                    // 18-28, качество
+  captureMode: 'screen' | 'window' | 'area';
+  selectedSourceId: string | null;
+  hotkeys: {
+    startStop: string;            // "F9"
+    pause: string;                // "F10"
+  };
+  minimizeToTray: boolean;
+  showNotifications: boolean;
+}
+```
+
+### 3.6 Интерфейс (React Components)
+
+**Структура UI:**
+
+```
+┌─────────────────────────────────────────┐
+│  [📁 Папка: C:\Videos\Recordings] [Изм] │
+├─────────────────────────────────────────┤
+│  Источник: [Весь экран ▼] [👁 Превью]   │
+├─────────────────────────────────────────┤
+│  FPS: [━━●━━━━] 0.5 к/с (1 кадр/2сек)  │
+│                                         │
+│  ☑ Игнорировать похожие кадры          │
+│  Порог изменения: [━━●━━] 5%           │
+├─────────────────────────────────────────┤
+│  Кодек: [H.264 ▼]  Качество: [23 ▼]    │
+├─────────────────────────────────────────┤
+│  ┌─────────┐  ┌─────────┐  ┌────────┐  │
+│  │   ⏺   │  │   ⏸   │  │   ⏹   │  │
+│  │ Запись │  │  Пауза │  │  Стоп  │  │
+│  └─────────┘  └─────────┘  └────────┘  │
+├─────────────────────────────────────────┤
+│  Запись: 00:12:34 | Кадров: 374        │
+└─────────────────────────────────────────┘
+```
+
+**Компоненты:**
+
+| Компонент | Props | Функционал |
+|-----------|-------|------------|
+| `SourceSelector` | `sources[], selectedId, onSelect` | Список экранов/окон с превью |
+| `FpsSlider` | `value, onChange` | Логарифмическая шкала 1/64..1 |
+| `ThresholdControl` | `enabled, value, onChange` | Чекбокс + слайдер |
+| `RecorderButton` | `state: 'idle' \| 'recording' \| 'paused'` | Анимация, цвета |
+| `StatusDisplay` | `duration, frameCount, fileSize` | Форматирование времени |
+
+---
+
+## 4. Этапы разработки
+
+### Этап 1: Скелет приложения 
+- Инициализация проекта: `npm create @quick-start/electron`
+- Настройка Vite + React + TypeScript + Tailwind
+- Базовое окно Electron, preload-скрипт
+- Простой IPC ping/pong
+
+### Этап 2: Интерфейс 
+- Вёрстка всех компонентов (без логики)
+- Состояние через Zustand
+- Темная/светлая тема (Tailwind dark:)
+
+### Этап 3: Захват экрана
+- Интеграция `desktopCapturer`
+- Выбор источника, превью
+- Сохранение выбора в конфиг
+
+### Этап 4: FFmpeg интеграция
+- Загрузка бинарников для всех платформ
+- Обертка FFmpegService
+- Тестовая запись видео
+- Обработка ошибок, логирование
+
+### Этап 5: Движок записи 
+- Таймер с точным FPS
+- Буферизация кадров
+- Пауза/возобновление
+- Индикация статуса в реальном времени
+
+### Этап 6: Оптимизации
+- Режим игнорирования похожих кадров
+- Оптимизация памяти (потоковая запись)
+- Прогресс-бар кодирования
+
+### Этап 7: Системная интеграция 
+- Трей с контекстным меню
+- Глобальные горячие клавиши
+- Автозапуск (опционально)
+- Нативные уведомления
+
+### Этап 8: Сборка и распространение 
+- Настройка electron-builder
+- Подпись кода (Windows: signtool, macOS: notarization)
+- Автообновление через GitHub Releases
+- Создание установщиков
+
+---
+
+## 5. Особенности реализации Time Lapse
+
+### Проблема: Низкий FPS в FFmpeg
+
+**Решение:** Использовать `image2pipe` или промежуточные файлы
+
+```typescript
+// При FPS < 1 лучше сохранять кадры отдельно
+private async captureFrame(): Promise<Buffer> {
+  const sources = await desktopCapturer.getSources({
+    types: ['screen'],
+    thumbnailSize: { width: 1920, height: 1080 }
+  });
+  return sources[0].thumbnail.toPNG();
+}
+
+// Сборка в конце записи
+private async finalizeRecording(): Promise<void> {
+  await this.ffmpeg.exec([
+    '-framerate', String(this.fps),
+    '-i', 'frame_%04d.png',
+    '-c:v', 'libx264',
+    '-pix_fmt', 'yuv420p',
+    'output.mp4'
+  ]);
+}
+```
+
+### Проблема: Сравнение кадров в JS медленное
+
+**Решение:** Делегировать FFmpeg
+
+```typescript
+// FFmpeg сам фильтрует похожие кадры
+const filter = `select=gt(scene\\,${threshold/100})`;
+await this.ffmpeg.exec([
+  '-i', 'input.mp4',
+  '-vf', filter,
+  '-vsync', 'vfr',
+  'output.mp4'
+]);
+```
+
+---
+
+## 6. Кроссплатформенные нюансы
+
+| Платформа | Особенность | Решение |
+|-----------|-------------|---------|
+| **Windows** | Пути с пробелами, брандмауэр | Экранирование путей, запрос прав |
+| **macOS** | Разрешения Screen Recording | Инструкция в README, проверка `systemPreferences` |
+| **macOS** | Notarization для запуска | `electron-builder` + Apple Developer ID |
+| **Linux** | Wayland vs X11 | FFmpeg `x11grab` или `wayland` плагины |
+
+---
+
+## 7. Производительность и оптимизации
+
+| Проблема | Решение |
+|----------|---------|
+| Утечка памяти при долгой записи | Потоковая запись в FFmpeg, не хранить кадры |
+| Блокировка UI при кодировании | FFmpeg в отдельном `worker_threads` |
+| Большой размер приложения | Сжатие бинарников FFmpeg, удаление ненужных кодеков |
+| Задержка при старте записи | Предварительный "прогрев" FFmpeg |
+
+---
+
+## 8. Дополнительные возможности (v2.0)
+
+- Выбор области экрана (drag-and-drop рамка)
+- Веб-камера picture-in-picture
+- Автоматическая остановка по таймеру/размеру файла
+- Облачная загрузка (YouTube, Google Drive)
+- Журналирование активности (какое окно было активно)
+
+---
