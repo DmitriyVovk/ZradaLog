@@ -19,7 +19,11 @@ export const LogWindow: React.FC = () => {
   useEffect(() => {
     if (!window.zradaLogger) return;
     const unsub = window.zradaLogger.subscribe((entry: LogEntry) => {
-      setLogs((s) => [entry, ...s].slice(0, 1000));
+      setLogs((s) => {
+        const next = [entry, ...s];
+        if (next.length > 500) next.length = 500; // keep newest 500
+        return next;
+      });
     });
     return () => unsub && unsub();
   }, []);

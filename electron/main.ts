@@ -2,9 +2,11 @@ import { app, BrowserWindow, ipcMain } from 'electron';
 import path from 'path';
 import os from 'os';
 import { LoggerService } from './services/LoggerService';
+import { RecorderEngine } from './services/RecorderEngine';
 
 let mainWindow: BrowserWindow | null = null;
 let logger: LoggerService;
+let recorder: RecorderEngine | null = null;
 let rendererReady = false;
 const pendingLogs: any[] = [];
 
@@ -44,6 +46,24 @@ app.whenReady().then(() => {
   });
 
   createWindow();
+  // create recorder engine and wire events
+  recorder = new RecorderEngine(logger);
+  recorder.on('started', () => {
+    logger.info('Recorder state', { state: recorder?.getState() });
+    if (rendererReady && mainWindow) mainWindow.webContents.send('zrada:recorder-state', recorder?.getState());
+  });
+  recorder.on('paused', () => {
+    logger.info('Recorder state', { state: recorder?.getState() });
+    if (rendererReady && mainWindow) mainWindow.webContents.send('zrada:recorder-state', recorder?.getState());
+  });
+  recorder.on('resumed', () => {
+    logger.info('Recorder state', { state: recorder?.getState() });
+    if (rendererReady && mainWindow) mainWindow.webContents.send('zrada:recorder-state', recorder?.getState());
+  });
+  recorder.on('stopped', () => {
+    logger.info('Recorder state', { state: recorder?.getState() });
+    if (rendererReady && mainWindow) mainWindow.webContents.send('zrada:recorder-state', recorder?.getState());
+  });
   // now emit startup info (after window created and forwarder registered)
   logger.info('App starting', { platform: os.platform() });
   // welcome + structured startup info
@@ -86,6 +106,21 @@ app.whenReady().then(() => {
     const { level, message, meta } = payload;
     // write to main logger
     (logger as LoggerService).log(level, message, meta);
+  });
+
+  // control messages from renderer (start/pause/resume/stop)
+  ipcMain.on('zrada:control', (_ev, action: string) => {
+    if (!recorder) return;
+    switch (action) {
+      case 'start': recorder.start(); break;
+      case 'pause': recorder.pause(); break;
+      case 'resume': recorder.resume(); break;
+      case 'stop': recorder.stop(); break;
+    }
+  });
+
+  ipcMain.handle('zrada:get-state', () => {
+    return recorder ? recorder.getState() : 'idle';
   });
 
   app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });

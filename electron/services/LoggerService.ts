@@ -53,7 +53,7 @@ export class LoggerService extends EventEmitter {
   }
 
   public log(level: LogLevel, message: string, meta?: Record<string, any>) {
-    const entry: LogEntry = { ts: new Date().toISOString(), level, message, meta };
+    const entry: LogEntry = { ts: LoggerService.formatTimestamp(new Date()), level, message, meta };
     this.write(entry);
   }
 
@@ -69,3 +69,18 @@ export class LoggerService extends EventEmitter {
 }
 
 export default LoggerService;
+
+// Helper: format Date -> yyyy:mm:dd hh:mm:ss.mmm (local time)
+export namespace LoggerService {
+  export function pad(n: number, width = 2) { return n.toString().padStart(width, '0'); }
+  export function formatTimestamp(d: Date) {
+    const yyyy = d.getFullYear();
+    const mm = pad(d.getMonth() + 1);
+    const dd = pad(d.getDate());
+    const hh = pad(d.getHours());
+    const min = pad(d.getMinutes());
+    const ss = pad(d.getSeconds());
+    const ms = pad(d.getMilliseconds(), 3);
+    return `${yyyy}:${mm}:${dd} ${hh}:${min}:${ss}.${ms}`;
+  }
+}

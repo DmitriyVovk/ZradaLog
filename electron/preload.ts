@@ -11,6 +11,19 @@ contextBridge.exposeInMainWorld('zradaLogger', {
   }
 });
 
+contextBridge.exposeInMainWorld('zradaControls', {
+  start: () => ipcRenderer.send('zrada:control', 'start'),
+  pause: () => ipcRenderer.send('zrada:control', 'pause'),
+  resume: () => ipcRenderer.send('zrada:control', 'resume'),
+  stop: () => ipcRenderer.send('zrada:control', 'stop'),
+  getState: () => ipcRenderer.invoke('zrada:get-state'),
+  subscribeState: (cb: (state: string) => void) => {
+    const handler = (_ev: IpcRendererEvent, state: string) => cb(state);
+    ipcRenderer.on('zrada:recorder-state', handler);
+    return () => ipcRenderer.removeListener('zrada:recorder-state', handler);
+  }
+});
+
 // Notify main that renderer is ready to receive logs
 (globalThis as any).addEventListener?.('DOMContentLoaded', () => {
   try { ipcRenderer.send('zrada:renderer-ready'); } catch (_) {}
