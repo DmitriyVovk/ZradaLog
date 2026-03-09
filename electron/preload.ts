@@ -17,6 +17,8 @@ contextBridge.exposeInMainWorld('zradaControls', {
   resume: () => ipcRenderer.send('zrada:control', 'resume'),
   stop: () => ipcRenderer.send('zrada:control', 'stop'),
   getState: () => ipcRenderer.invoke('zrada:get-state'),
+  setFps: (fps: number) => ipcRenderer.invoke('zrada:set-fps', fps),
+  getFps: () => ipcRenderer.invoke('zrada:get-fps'),
   subscribeState: (cb: (state: string) => void) => {
     const handler = (_ev: IpcRendererEvent, state: string) => cb(state);
     ipcRenderer.on('zrada:recorder-state', handler);

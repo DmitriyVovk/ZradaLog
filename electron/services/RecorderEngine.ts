@@ -37,6 +37,10 @@ export class RecorderEngine extends EventEmitter {
     this.logger.debug('FPS set', { fps });
   }
 
+  public getFps() {
+    return this.fps;
+  }
+
   public getSegments() {
     try { return fs.readdirSync(this.segmentsDir).map(f => path.join(this.segmentsDir, f)).sort(); }
     catch { return []; }

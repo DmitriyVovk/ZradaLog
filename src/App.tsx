@@ -3,6 +3,7 @@ import LogWindow from './components/LogWindow';
 
 export const App: React.FC = () => {
   const [state, setState] = React.useState<string>('idle');
+  const [fps, setFps] = React.useState<number>(1);
 
   React.useEffect(() => {
     const init = async () => {
@@ -11,6 +12,15 @@ export const App: React.FC = () => {
       // getState may be a Promise
       const resolved = typeof s === 'string' ? s : await s;
       setState(resolved);
+      // fetch current FPS
+      try {
+        const g = (window as any).zradaControls?.getFps?.();
+        const got = typeof g === 'number' ? g : await g;
+        const v = got?.fps ?? got ?? 1;
+        setFps(Number(v) || 1);
+      } catch (_) {
+        setFps(1);
+      }
       // subscribe to state changes
       const unsub = (window as any).zradaControls?.subscribeState?.((st: string) => setState(st));
       return () => { if (typeof unsub === 'function') unsub(); };
@@ -24,6 +34,27 @@ export const App: React.FC = () => {
         <div>ZradaLog — Dev UI</div>
         <div style={{display:'flex', gap:8}}>
           <div style={{alignSelf:'center', color:'#9fd'}}>{state.toUpperCase()}</div>
+          <div style={{display:'flex', alignItems:'center', gap:8}}>
+            <label style={{color:'#9fd', fontSize:12}}>FPS</label>
+            <input
+              type="range"
+              min={0.1}
+              max={5}
+              step={0.1}
+              value={fps}
+              onChange={async (e) => {
+                const v = Number((e.target as HTMLInputElement).value);
+                setFps(v);
+                try {
+                  await (window as any).zradaControls?.setFps?.(v);
+                } catch (err) {
+                  console.error('setFps failed', err);
+                }
+              }}
+              style={{width:140}}
+            />
+            <div style={{color:'#9fd', minWidth:40, textAlign:'right'}}>{fps.toFixed(1)} fps</div>
+          </div>
           <button onClick={() => (window as any).zradaControls?.start?.()}>Start</button>
           <button onClick={() => (window as any).zradaControls?.pause?.()}>Pause</button>
           <button onClick={() => (window as any).zradaControls?.resume?.()}>Resume</button>

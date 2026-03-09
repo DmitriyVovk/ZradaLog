@@ -152,6 +152,28 @@ app.whenReady().then(() => {
     return recorder ? recorder.getState() : 'idle';
   });
 
+  ipcMain.handle('zrada:set-fps', (_ev, fps: number) => {
+    try {
+      const v = Number(fps) || 1;
+      recorder?.setFps(v);
+      logger.info('FPS set via IPC', { fps: v });
+      return { ok: true, fps: v };
+    } catch (e: any) {
+      logger.error('Set FPS failed', { err: e?.message });
+      return { ok: false, err: e?.message };
+    }
+  });
+
+  ipcMain.handle('zrada:get-fps', () => {
+    try {
+      const v = recorder ? recorder.getFps() : 1;
+      return { ok: true, fps: v };
+    } catch (e: any) {
+      logger.error('Get FPS failed', { err: e?.message });
+      return { ok: false, err: e?.message };
+    }
+  });
+
   ipcMain.handle('zrada:open-segments', async () => {
     try {
       const dir = path.join(app.getPath('userData'), 'segments');
