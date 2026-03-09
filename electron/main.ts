@@ -169,7 +169,6 @@ app.whenReady().then(() => {
   ipcMain.handle('zrada:delete-all', async () => {
     try {
       const segDir = path.join(app.getPath('userData'), 'segments');
-      const outDir = path.join(app.getPath('userData'), 'output');
       let deleted = 0;
       if (fs.existsSync(segDir)) {
         const files = fs.readdirSync(segDir);
@@ -177,13 +176,7 @@ app.whenReady().then(() => {
           try { fs.unlinkSync(path.join(segDir, f)); deleted++; } catch (_) {}
         }
       }
-      if (fs.existsSync(outDir)) {
-        const files = fs.readdirSync(outDir);
-        for (const f of files) {
-          try { fs.unlinkSync(path.join(outDir, f)); deleted++; } catch (_) {}
-        }
-      }
-      logger.info('Deleted all media files', { deleted });
+      logger.info('Deleted segment files only', { deleted });
       return { ok: true, deleted };
     } catch (e: any) {
       logger.error('Delete all failed', { err: e?.message });

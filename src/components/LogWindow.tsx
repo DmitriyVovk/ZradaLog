@@ -28,6 +28,20 @@ export const LogWindow: React.FC = () => {
     return () => unsub && unsub();
   }, []);
 
+  const clearAll = async () => {
+    // clear UI
+    setLogs([]);
+    // clear disk logs via main
+    if ((window as any).zradaAdmin?.clearLogs) {
+      try {
+        const res = await (window as any).zradaAdmin.clearLogs();
+        if (!res?.ok) alert('Clear logs failed: ' + (res?.err || 'unknown'));
+      } catch (e) {
+        alert('Clear logs error: ' + String(e));
+      }
+    }
+  };
+
   const filtered = useMemo(() => logs.filter(l => {
     const levels = ['debug','info','warn','error'];
     if (levels.indexOf(l.level) < levels.indexOf(levelFilter)) return false;
@@ -54,6 +68,9 @@ export const LogWindow: React.FC = () => {
             {l.meta && <pre style={{whiteSpace:'pre-wrap', margin:0}}>{JSON.stringify(l.meta)}</pre>}
           </div>
         ))}
+      </div>
+      <div style={{display:'flex', justifyContent:'flex-end', marginTop:8}}>
+        <button onClick={clearAll}>Clear</button>
       </div>
     </div>
   );
