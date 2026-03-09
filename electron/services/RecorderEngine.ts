@@ -42,7 +42,7 @@ export class RecorderEngine extends EventEmitter {
     catch { return []; }
   }
 
-  private buildFfmpegArgs(outPattern: string) {
+  private buildFfmpegArgs(outPattern: string, startNumber = 0) {
     // Using gdigrab for Windows screen capture. Assumes ffmpeg is available.
     const args: string[] = [
       '-y',
@@ -56,9 +56,22 @@ export class RecorderEngine extends EventEmitter {
       '-f', 'segment',
       '-reset_timestamps', '1',
       '-segment_time', String(this.segmentIntervalSec),
+      '-segment_start_number', String(startNumber),
       outPattern
     ];
     return args;
+  }
+
+  private computeNextIndex(fileNames: string[]) {
+    let max = -1;
+    for (const name of fileNames) {
+      const m = name.match(/segment_(\d+)\.mp4$/);
+      if (m) {
+        const n = parseInt(m[1], 10);
+        if (!isNaN(n) && n > max) max = n;
+      }
+    }
+    return max + 1;
   }
 
   public start() {
@@ -90,8 +103,13 @@ export class RecorderEngine extends EventEmitter {
       return;
     }
 
-    const args = this.buildFfmpegArgs(outPattern);
-    this.logger.info('Spawning ffmpeg', { args });
+    const existing = this.getSegments();
+    const existingFiles = existing.map(f => path.basename(f));
+    this.logger.debug('Existing segments before start', { count: existing.length, files: existingFiles });
+    const nextIndex = this.computeNextIndex(existingFiles);
+
+    const args = this.buildFfmpegArgs(outPattern, nextIndex);
+    this.logger.info('Spawning ffmpeg', { args, startIndex: nextIndex });
 
     this.ff = spawn('ffmpeg', args, { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
 

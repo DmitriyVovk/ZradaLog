@@ -24,6 +24,15 @@ contextBridge.exposeInMainWorld('zradaControls', {
   }
 });
 
+contextBridge.exposeInMainWorld('zradaFS', {
+  openSegmentsFolder: () => ipcRenderer.invoke('zrada:open-segments')
+});
+
+contextBridge.exposeInMainWorld('zradaAdmin', {
+  deleteAllFiles: () => ipcRenderer.invoke('zrada:delete-all'),
+  clearLogs: () => ipcRenderer.invoke('zrada:clear-logs')
+});
+
 // Notify main that renderer is ready to receive logs
 (globalThis as any).addEventListener?.('DOMContentLoaded', () => {
   try { ipcRenderer.send('zrada:renderer-ready'); } catch (_) {}

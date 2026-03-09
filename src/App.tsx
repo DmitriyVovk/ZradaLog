@@ -28,6 +28,21 @@ export const App: React.FC = () => {
           <button onClick={() => (window as any).zradaControls?.pause?.()}>Pause</button>
           <button onClick={() => (window as any).zradaControls?.resume?.()}>Resume</button>
           <button onClick={() => (window as any).zradaControls?.stop?.()}>Stop</button>
+          <button onClick={async () => {
+            const res = await (window as any).zradaFS?.openSegmentsFolder?.();
+            if (!res?.ok) alert('Open folder failed: ' + (res?.err || 'unknown'));
+          }}>Open segments folder</button>
+          <button onClick={async () => {
+            if (!confirm('Delete ALL segments and output files? This cannot be undone.')) return;
+            const res = await (window as any).zradaAdmin?.deleteAllFiles?.();
+            if (res?.ok) alert('Deleted files: ' + res.deleted);
+            else alert('Delete failed: ' + (res?.err || 'unknown'));
+          }}>Delete all files</button>
+          <button onClick={async () => {
+            if (!confirm('Clear logs?')) return;
+            const res = await (window as any).zradaAdmin?.clearLogs?.();
+            if (res?.ok) alert('Logs cleared'); else alert('Clear failed: ' + (res?.err || 'unknown'));
+          }}>Clear logs</button>
         </div>
       </header>
       <main style={{padding:10, flex:1}}>

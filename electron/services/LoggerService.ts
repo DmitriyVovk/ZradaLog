@@ -66,6 +66,21 @@ export class LoggerService extends EventEmitter {
     if (this.stream) this.stream.end();
     this.stream = null;
   }
+
+  public clear() {
+    try {
+      if (this.stream) this.stream.end();
+      const files = fs.readdirSync(this.dir).filter(f => f.endsWith('.logl'));
+      for (const f of files) {
+        try { fs.unlinkSync(path.join(this.dir, f)); } catch (_) {}
+      }
+      this.filePath = this.makeFilePath();
+      this.stream = fs.createWriteStream(this.filePath, { flags: 'a' });
+      this.info('Logs cleared');
+    } catch (e) {
+      // ignore
+    }
+  }
 }
 
 export default LoggerService;
