@@ -14,7 +14,7 @@ export class MergerService {
    * Merge segments into single MP4 using ffmpeg concat demuxer.
    * segments: array of absolute paths
    */
-  public async mergeSegments(segments: string[], outPath: string): Promise<void> {
+  public async mergeSegments(segments: string[], outPath: string, options?: { inputFps?: number, outputFps?: number }): Promise<void> {
     if (!segments || segments.length === 0) throw new Error('No segments to merge');
 
     // sort segments by numeric index if they follow segment_XXXX.mp4 pattern
@@ -33,11 +33,56 @@ export class MergerService {
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 
     const listFile = path.join(dir, `concat_${Date.now()}.txt`);
-    const contents = ordered.map(s => `file '${s.replace(/'/g, "'\\'\'")}'`).join('\n');
-    fs.writeFileSync(listFile, contents);
+
+    const inputFps = options?.inputFps ?? 1;
+    const outputFps = options?.outputFps ?? 30;
+    // compute speedup factor: how much to compress time. If inputFps is low (eg 0.2 fps = one frame per 5s)
+    // we want output to play at outputFps, so factor = outputFps / inputFps
+    const factor = inputFps > 0 ? (outputFps / inputFps) : outputFps;
+
+    // If only one segment, avoid concat demuxer (can fail on some MP4s); re-encode single file directly
+    if (ordered.length === 1) {
+      const single = ordered[0];
+      return new Promise((resolve, reject) => {
+        const args = [
+          '-i', single,
+          '-vf', `setpts=PTS/${factor}`,
+          '-r', String(outputFps),
+          '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23',
+          outPath
+        ];
+        const ff = spawn('ffmpeg', args, { windowsHide: true });
+
+        ff.stderr.on('data', (chunk) => { this.logger.debug('ffmpeg', { stderr: chunk.toString() }); });
+
+        ff.on('close', (code) => {
+          if (code === 0) {
+            this.logger.info('Merge complete (single)', { outPath });
+            resolve();
+          } else {
+            this.logger.error('Merge failed (single)', { code });
+            reject(new Error(`ffmpeg exited with ${code}`));
+          }
+        });
+
+        ff.on('error', (err) => { this.logger.error('ffmpeg spawn failed', { err: err.message }); reject(err); });
+      });
+    }
+
+    // Multiple segments: build concat list
+    const escapeForList = (p: string) => p.replace(/'/g, "'\\''");
+    const contents = ordered.map(s => `file '${escapeForList(s)}'`).join('\n');
+    fs.writeFileSync(listFile, contents, { encoding: 'utf8' });
 
     return new Promise((resolve, reject) => {
-      const args = ['-f', 'concat', '-safe', '0', '-i', listFile, '-c', 'copy', outPath];
+      // Re-encode and remap timestamps to create a time-lapse video
+      const args = [
+        '-f', 'concat', '-safe', '0', '-i', listFile,
+        '-vf', `setpts=PTS/${factor}`,
+        '-r', String(outputFps),
+        '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23',
+        outPath
+      ];
       const ff = spawn('ffmpeg', args, { windowsHide: true });
 
       ff.stderr.on('data', (chunk) => {

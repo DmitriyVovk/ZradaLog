@@ -75,7 +75,16 @@ app.whenReady().then(() => {
         if (!fs.existsSync(outDir)) fs.mkdirSync(outDir, { recursive: true });
         const outPath = path.join(outDir, formatNowForFilename());
         logger.info('Auto-merge triggered on stop', { count: segs.length, outPath });
-        merger.mergeSegments(segs, outPath).then(() => {
+        // obtain recorder FPS (RecorderEngine.getFps returns a number)
+        let inputFpsRaw: any = 1;
+        try { inputFpsRaw = recorder?.getFps?.(); } catch (_) { inputFpsRaw = 1; }
+        // coerce possible shapes: number or { ok:true, fps: n }
+        let resolvedInputFps = 1;
+        if (typeof inputFpsRaw === 'number') resolvedInputFps = inputFpsRaw;
+        else if (inputFpsRaw && typeof inputFpsRaw === 'object' && 'fps' in inputFpsRaw) resolvedInputFps = Number((inputFpsRaw as any).fps) || 1;
+        else resolvedInputFps = 1;
+
+        merger.mergeSegments(segs, outPath, { inputFps: resolvedInputFps, outputFps: 30 }).then(() => {
           logger.info('Auto-merge finished', { outPath });
           if (rendererReady && mainWindow) mainWindow.webContents.send('zrada:merge-done', outPath);
           // delete segments after successful merge
