@@ -34,6 +34,15 @@ contextBridge.exposeInMainWorld('zradaControls', {
   }
 });
 
+// frame events (used/skipped) from main
+contextBridge.exposeInMainWorld('zradaFrames', {
+  subscribe: (cb: (entry: any) => void) => {
+    const handler = (_ev: IpcRendererEvent, entry: any) => cb(entry);
+    ipcRenderer.on('zrada:frame', handler);
+    return () => ipcRenderer.removeListener('zrada:frame', handler);
+  }
+});
+
 contextBridge.exposeInMainWorld('zradaFS', {
   openSegmentsFolder: () => ipcRenderer.invoke('zrada:open-segments')
 });

@@ -136,6 +136,28 @@ app.whenReady().then(() => {
       logger.error('Auto-merge error', { err: e?.message });
     }
   });
+  // forward image/segment events and provide simple used/skip heuristic
+  let lastImageSize: number | null = null;
+  recorder.on('image', (filePath: string) => {
+    try {
+      let status = 'used';
+      let size = 0;
+      try { const st = fs.statSync(filePath); size = st.size; } catch (_) { size = 0; }
+      if (lastImageSize !== null) {
+        const diff = Math.abs(size - lastImageSize);
+        // if size very similar (within 3 bytes) treat as skipped candidate
+        if (diff <= 3) status = 'skipped';
+      }
+      lastImageSize = size;
+      logger.debug('Image event', { filePath, size, status });
+      if (rendererReady && mainWindow) mainWindow.webContents.send('zrada:frame', { file: filePath, size, status });
+    } catch (e: any) { logger.error('Forward image event failed', { err: e?.message }); }
+  });
+  recorder.on('segment', (filePath: string) => {
+    try {
+      if (rendererReady && mainWindow) mainWindow.webContents.send('zrada:segment', { file: filePath });
+    } catch (e: any) { logger.error('Forward segment event failed', { err: e?.message }); }
+  });
   // now emit startup info (after window created and forwarder registered)
   logger.info('App starting', { platform: os.platform() });
   // welcome + structured startup info
