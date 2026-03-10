@@ -27,6 +27,14 @@ contextBridge.exposeInMainWorld('zradaControls', {
   getDedupSettings: () => ipcRenderer.invoke('zrada:get-dedup-settings'),
   setDedupSettings: (s: any) => ipcRenderer.invoke('zrada:set-dedup-settings', s),
   previewDedupScan: (opts: any) => ipcRenderer.invoke('zrada:preview-dedup-scan', opts),
+  getSettings: () => ipcRenderer.invoke('zrada:get-settings'),
+  setSettings: (s: any) => ipcRenderer.invoke('zrada:set-settings', s),
+  checkActiveCaptureProcesses: () => ipcRenderer.invoke('zrada:check-active-capture-processes'),
+  subscribeStartBlocked: (cb: (payload: any) => void) => {
+    const handler = (_ev: IpcRendererEvent, payload: any) => cb(payload);
+    ipcRenderer.on('zrada:start-blocked', handler);
+    return () => ipcRenderer.removeListener('zrada:start-blocked', handler);
+  },
   subscribeState: (cb: (state: string) => void) => {
     const handler = (_ev: IpcRendererEvent, state: string) => cb(state);
     ipcRenderer.on('zrada:recorder-state', handler);
@@ -41,6 +49,8 @@ contextBridge.exposeInMainWorld('zradaFrames', {
     ipcRenderer.on('zrada:frame', handler);
     return () => ipcRenderer.removeListener('zrada:frame', handler);
   }
+  ,
+  getRecent: (n = 8) => ipcRenderer.invoke('zrada:get-recent-frames', n)
 });
 
 contextBridge.exposeInMainWorld('zradaFS', {

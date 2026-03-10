@@ -13,8 +13,27 @@ const ModeControls: React.FC<ModeControlsProps> = ({ mode, setMode, fps, setFps,
   const [dedupAlg, setDedupAlg] = React.useState<'none' | 'phash' | 'ssim'>('phash');
   const [dedupThreshold, setDedupThreshold] = React.useState<number>(12);
   const [scanResult, setScanResult] = React.useState<any>(null);
+  const [lastFrame, setLastFrame] = React.useState<{ file?: string; size?: number; status?: string } | null>(null);
 
   React.useEffect(() => {
+    // subscribe to recent frames for indicator
+    if ((window as any).zradaFrames?.subscribe) {
+      const unsub = (window as any).zradaFrames.subscribe((entry: any) => {
+        const s = (entry && entry.status && String(entry.status).toLowerCase()) === 'skipped' ? 'skipped' : 'used';
+        setLastFrame({ file: entry?.file, size: entry?.size, status: s });
+      });
+      (async () => {
+        try {
+          const r = await (window as any).zradaFrames?.getRecent?.(8);
+          if (r && r.ok && Array.isArray(r.frames) && r.frames.length > 0) {
+            const last = r.frames[r.frames.length - 1];
+            const s2 = last && String(last.status).toLowerCase() === 'skipped' ? 'skipped' : 'used';
+            setLastFrame({ file: last.file, size: last.size, status: s2 });
+          }
+        } catch (_) {}
+      })();
+      return () => unsub && unsub();
+    }
     // try to load persisted dedup settings from main process
     const load = async () => {
       try {
@@ -45,6 +64,14 @@ const ModeControls: React.FC<ModeControlsProps> = ({ mode, setMode, fps, setFps,
   return (
     <div>
       <h2>Mode & FPS</h2>
+      <div style={{marginTop:8, display:'flex', alignItems:'center', gap:10}}>
+        <div style={{fontSize:12}}>Last frame:</div>
+        <div style={{display:'flex', alignItems:'center', gap:8}}>
+          <span style={{width:14, height:14, borderRadius:7, display:'inline-block', background: lastFrame ? (lastFrame.status === 'skipped' ? '#ff8800' : '#22cc44') : '#888', boxShadow:'0 0 4px rgba(0,0,0,0.4)'}} />
+          <div style={{minWidth:80, fontWeight:600}}>{lastFrame ? (lastFrame.status === 'skipped' ? 'SKIPPED' : 'USED') : '—'}</div>
+          <div style={{fontSize:11, color:'#666'}}>{lastFrame?.file ? lastFrame.file.split(/[\\/]/).pop() : ''}</div>
+        </div>
+      </div>
       <div style={{marginTop:8}}>
         <label style={{display:'block', marginBottom:6}}>Mode</label>
         <select value={mode} onChange={(e) => setMode((e.target as HTMLSelectElement).value as any)} style={{padding:6, background:'#222', color:'#fff'}}>

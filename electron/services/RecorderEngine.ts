@@ -15,6 +15,8 @@ export class RecorderEngine extends EventEmitter {
   private ff?: ChildProcessWithoutNullStreams;
   private segmentsDir: string;
   private segments: string[] = [];
+  private imageWatcher?: fs.FSWatcher;
+  private emittedImages: Set<string> = new Set();
   private codec = 'libx264';
   private crf = 23;
   private mode: 'video' | 'image' = 'video';
@@ -151,6 +153,32 @@ export class RecorderEngine extends EventEmitter {
 
     let args: string[];
     if (this.mode === 'image') {
+      // start filesystem watcher for images to reliably detect new frames
+      try {
+        const imgDir = path.join(this.segmentsDir, 'images');
+        if (!fs.existsSync(imgDir)) fs.mkdirSync(imgDir, { recursive: true });
+        // clear previous state
+        this.emittedImages.clear();
+        if (this.imageWatcher) try { this.imageWatcher.close(); } catch (_) {}
+        this.imageWatcher = fs.watch(imgDir, (eventType, filename) => {
+          try {
+            if (!filename) return;
+            if (!/img_\d+\.(jpe?g|png)$/i.test(filename)) return;
+            const full = path.join(imgDir, filename);
+            // small delay to allow file to be fully written
+            setTimeout(() => {
+              try {
+                if (!fs.existsSync(full)) return;
+                if (this.emittedImages.has(full)) return;
+                this.emittedImages.add(full);
+                this.segments.push(full);
+                this.logger.info('Image written (fswatch)', { file: full });
+                this.emit('image', full);
+              } catch (_) {}
+            }, 40);
+          } catch (_) {}
+        });
+      } catch (e: any) { this.logger.error('Image watcher failed', { err: e?.message }); }
       args = this.buildImageArgs(outImagePattern);
       this.logger.info('Spawning ffmpeg (image-sequence)', { args });
     } else {
@@ -170,7 +198,7 @@ export class RecorderEngine extends EventEmitter {
       // detect new segment creation
       // detect new file creation (video segments or image files)
       const mVideo = /Opening '(.+segment_\d+\.mp4)' for writing/.exec(s) || /Opening '(.+segment_\d+\.mp4)'/.exec(s);
-      const mImage = /Opening '(.+img_\d+\.jpg)' for writing/.exec(s) || /Opening '(.+img_\d+\.jpg)'/.exec(s);
+      const mImage = /Opening '(.+img_\d+\.(?:jpg|jpeg|png))' for writing/.exec(s) || /Opening '(.+img_\d+\.(?:jpg|jpeg|png))'/.exec(s);
       if (mVideo && mVideo[1]) {
         const file = mVideo[1];
         const abs = path.isAbsolute(file) ? file : path.join(this.segmentsDir, path.basename(file));
@@ -180,9 +208,13 @@ export class RecorderEngine extends EventEmitter {
       } else if (mImage && mImage[1]) {
         const file = mImage[1];
         const abs = path.isAbsolute(file) ? file : path.join(this.segmentsDir, 'images', path.basename(file));
-        this.segments.push(abs);
-        this.logger.info('Image written', { file: abs });
-        this.emit('image', abs);
+        // avoid duplicate emits if watcher already handled it
+        if (!this.emittedImages.has(abs)) {
+          this.emittedImages.add(abs);
+          this.segments.push(abs);
+          this.logger.info('Image written (stderr)', { file: abs });
+          this.emit('image', abs);
+        }
       }
     });
 
@@ -193,6 +225,8 @@ export class RecorderEngine extends EventEmitter {
         this.state = 'stopped';
         this.emit('stopped');
       }
+      // stop watcher
+      try { if (this.imageWatcher) { this.imageWatcher.close(); this.imageWatcher = undefined; } } catch (_) {}
       this.ff = undefined;
     });
 

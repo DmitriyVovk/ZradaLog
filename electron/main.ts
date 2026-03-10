@@ -1,5 +1,5 @@
 import { app, BrowserWindow, ipcMain, shell } from 'electron';
-import { spawn } from 'child_process';
+import { spawn, execFileSync } from 'child_process';
 import path from 'path';
 import os from 'os';
 import fs from 'fs';
@@ -14,6 +14,74 @@ let merger: MergerService | null = null;
 let rendererReady = false;
 const pendingLogs: any[] = [];
 let outputFps = 24;
+// persisted settings path
+const settingsPath = path.join(app.getPath('userData') || '.', 'settings.json');
+let settingsCache: any = null;
+let dedupSettings: { algorithm: string; threshold: number } = { algorithm: 'phash', threshold: 12 };
+
+function loadSettings() {
+  try {
+    if (fs.existsSync(settingsPath)) {
+      const raw = fs.readFileSync(settingsPath, 'utf8');
+      settingsCache = JSON.parse(raw || '{}');
+    } else {
+      settingsCache = {};
+    }
+  } catch (e) {
+    settingsCache = {};
+  }
+  return settingsCache;
+}
+
+function saveSettings() {
+  try {
+    settingsCache = settingsCache || {};
+    settingsCache.dedupSettings = dedupSettings;
+    settingsCache.outputFps = outputFps;
+    fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
+    fs.writeFileSync(settingsPath, JSON.stringify(settingsCache, null, 2), 'utf8');
+    logger && logger.info && logger.info('Settings saved', { path: settingsPath });
+    return { ok: true };
+  } catch (e: any) {
+    logger && logger.error && logger.error('Save settings failed', { err: e?.message });
+    return { ok: false, err: e?.message };
+  }
+}
+
+function checkActiveCaptureProcesses() {
+  try {
+    if (process.platform === 'win32') {
+      const out = execFileSync('tasklist', ['/FO', 'CSV', '/NH'], { encoding: 'utf8' });
+      const lines = out.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+      const matches: Array<{ image: string; pid: number; raw: string }> = [];
+      for (const line of lines) {
+        // CSV: "Image Name","PID","Session Name","Session#","Mem Usage"
+        const parts = line.split(/","|","/).map(p => p.replace(/^"|"$/g, ''));
+        const img = parts[0] || '';
+        const pid = Number(parts[1] || 0) || 0;
+        if (/ffmpeg/i.test(img)) matches.push({ image: img, pid, raw: line });
+      }
+      return matches;
+    } else {
+      // fallback: ps on *nix
+      try {
+        const out = execFileSync('ps', ['-axo', 'pid,comm,args'], { encoding: 'utf8' });
+        const lines = out.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+        const matches: Array<{ image: string; pid: number; raw: string }> = [];
+        for (const line of lines.slice(1)) {
+          if (/ffmpeg/i.test(line)) {
+            const parts = line.trim().split(/\s+/);
+            const pid = Number(parts[0] || 0) || 0;
+            matches.push({ image: parts[1] || 'ffmpeg', pid, raw: line });
+          }
+        }
+        return matches;
+      } catch (_) { return []; }
+    }
+  } catch (e) {
+    return [];
+  }
+}
 
 function createWindow() {
   mainWindow = new BrowserWindow({
@@ -51,6 +119,16 @@ app.whenReady().then(() => {
   });
 
   createWindow();
+  // load persisted settings if any
+  try {
+    const loaded = loadSettings() || {};
+    if (loaded.outputFps) outputFps = Number(loaded.outputFps) || outputFps;
+    if (loaded.dedupSettings) {
+      dedupSettings.algorithm = loaded.dedupSettings.algorithm ?? dedupSettings.algorithm;
+      dedupSettings.threshold = typeof loaded.dedupSettings.threshold === 'number' ? loaded.dedupSettings.threshold : dedupSettings.threshold;
+    }
+    logger.info('Loaded persisted settings', { outputFps, dedupSettings });
+  } catch (_) {}
   // create recorder engine and wire events
   recorder = new RecorderEngine(logger);
   merger = new MergerService(logger);
@@ -138,25 +216,42 @@ app.whenReady().then(() => {
   });
   // forward image/segment events and provide simple used/skip heuristic
   let lastImageSize: number | null = null;
+  const recentFrames: Array<{ file: string; size: number; status: string; ts: string }> = [];
   recorder.on('image', (filePath: string) => {
     try {
       let status = 'used';
       let size = 0;
       try { const st = fs.statSync(filePath); size = st.size; } catch (_) { size = 0; }
-      if (lastImageSize !== null) {
+      if (lastImageSize !== null && lastImageSize > 0 && size > 0) {
         const diff = Math.abs(size - lastImageSize);
-        // if size very similar (within 3 bytes) treat as skipped candidate
-        if (diff <= 3) status = 'skipped';
+        const ratio = diff / Math.max(size, lastImageSize);
+        // if size very similar (within 2%) treat as skipped candidate
+        if (ratio <= 0.02) status = 'skipped';
       }
-      lastImageSize = size;
+      lastImageSize = size || lastImageSize;
       logger.debug('Image event', { filePath, size, status });
-      if (rendererReady && mainWindow) mainWindow.webContents.send('zrada:frame', { file: filePath, size, status });
+      // keep small in-memory buffer for renderer to query
+      try {
+        recentFrames.push({ file: filePath, size: size || 0, status, ts: new Date().toISOString() });
+        if (recentFrames.length > 64) recentFrames.shift();
+      } catch (_) {}
+      logger.info('Forwarding frame to renderer', { file: filePath, size, status });
+      if (mainWindow && mainWindow.webContents) mainWindow.webContents.send('zrada:frame', { file: filePath, size, status });
     } catch (e: any) { logger.error('Forward image event failed', { err: e?.message }); }
   });
   recorder.on('segment', (filePath: string) => {
     try {
-      if (rendererReady && mainWindow) mainWindow.webContents.send('zrada:segment', { file: filePath });
+      if (mainWindow && mainWindow.webContents) mainWindow.webContents.send('zrada:segment', { file: filePath });
     } catch (e: any) { logger.error('Forward segment event failed', { err: e?.message }); }
+  });
+
+  ipcMain.handle('zrada:get-recent-frames', () => {
+    try {
+      return { ok: true, frames: recentFrames.slice(-16) };
+    } catch (e: any) {
+      logger.error('Get recent frames failed', { err: e?.message });
+      return { ok: false, err: e?.message };
+    }
   });
   // now emit startup info (after window created and forwarder registered)
   logger.info('App starting', { platform: os.platform() });
@@ -206,7 +301,18 @@ app.whenReady().then(() => {
   ipcMain.on('zrada:control', (_ev, action: string) => {
     if (!recorder) return;
     switch (action) {
-      case 'start': recorder.start(); break;
+      case 'start': {
+        try {
+          const active = checkActiveCaptureProcesses();
+          if (active && active.length > 0) {
+            logger.warn('Start blocked: active capture processes detected', { count: active.length });
+            if (mainWindow && mainWindow.webContents) mainWindow.webContents.send('zrada:start-blocked', { procs: active });
+            return;
+          }
+        } catch (e: any) { logger.error('Start pre-check failed', { err: e?.message }); }
+        recorder.start();
+        break;
+      }
       case 'pause': recorder.pause(); break;
       case 'resume': recorder.resume(); break;
       case 'stop': recorder.stop(); break;
@@ -284,6 +390,7 @@ app.whenReady().then(() => {
       const v = Number(fps) || 24;
       outputFps = v;
       logger.info('Output FPS set via IPC', { outputFps: v });
+      try { settingsCache = settingsCache || {}; settingsCache.outputFps = outputFps; saveSettings(); } catch (_) {}
       return { ok: true, fps: v };
     } catch (e: any) {
       logger.error('Set output FPS failed', { err: e?.message });
@@ -304,15 +411,13 @@ app.whenReady().then(() => {
     try {
       recorder?.setMode(mode);
       logger.info('Recorder mode set via IPC', { mode });
+      try { settingsCache = settingsCache || {}; settingsCache.mode = mode; saveSettings(); } catch (_) {}
       return { ok: true, mode };
     } catch (e: any) {
       logger.error('Set mode failed', { err: e?.message });
       return { ok: false, err: e?.message };
     }
   });
-
-  // dedup settings (simple in-memory store for now)
-  let dedupSettings: { algorithm: string; threshold: number } = { algorithm: 'phash', threshold: 12 };
   ipcMain.handle('zrada:get-dedup-settings', () => {
     return { ok: true, settings: dedupSettings };
   });
@@ -321,9 +426,20 @@ app.whenReady().then(() => {
       dedupSettings.algorithm = s?.algorithm ?? dedupSettings.algorithm;
       dedupSettings.threshold = typeof s?.threshold === 'number' ? s.threshold : dedupSettings.threshold;
       logger.info('Dedup settings updated', dedupSettings);
+      try { settingsCache = settingsCache || {}; settingsCache.dedupSettings = dedupSettings; saveSettings(); } catch (_) {}
       return { ok: true, settings: dedupSettings };
     } catch (e: any) {
       logger.error('Set dedup settings failed', { err: e?.message });
+      return { ok: false, err: e?.message };
+    }
+  });
+
+  ipcMain.handle('zrada:get-settings', () => {
+    try {
+      const s = loadSettings() || {};
+      return { ok: true, settings: s };
+    } catch (e: any) {
+      logger.error('Get settings failed', { err: e?.message });
       return { ok: false, err: e?.message };
     }
   });
@@ -359,6 +475,32 @@ app.whenReady().then(() => {
       return { ok: true, algorithm: alg, threshold: thr, total, kept, discarded, status: 'done' };
     } catch (e: any) {
       logger.error('Preview dedup scan failed', { err: e?.message });
+      return { ok: false, err: e?.message };
+    }
+  });
+
+  ipcMain.handle('zrada:check-active-capture-processes', () => {
+    try {
+      const procs = checkActiveCaptureProcesses();
+      return { ok: true, procs };
+    } catch (e: any) {
+      logger.error('Check active capture processes failed', { err: e?.message });
+      return { ok: false, err: e?.message };
+    }
+  });
+
+  ipcMain.handle('zrada:set-settings', (_ev, s: any) => {
+    try {
+      settingsCache = settingsCache || {};
+      settingsCache = { ...settingsCache, ...(s || {}) };
+      if (s?.dedupSettings) {
+        dedupSettings = { ...dedupSettings, ...s.dedupSettings };
+      }
+      if (s?.outputFps) outputFps = Number(s.outputFps) || outputFps;
+      saveSettings();
+      return { ok: true, settings: settingsCache };
+    } catch (e: any) {
+      logger.error('Set settings failed', { err: e?.message });
       return { ok: false, err: e?.message };
     }
   });
