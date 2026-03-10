@@ -7,7 +7,7 @@ import LogControls from './components/controls/LogControls';
 export const App: React.FC = () => {
   const [state, setState] = React.useState<string>('idle');
   const [fps, setFps] = React.useState<number>(1);
-  const [mode, setMode] = React.useState<'video' | 'image'>('video');
+  const [mode, setMode] = React.useState<'video' | 'image'>('image');
   const [outputFps, setOutputFps] = React.useState<number>(24);
   const [activeTab, setActiveTab] = React.useState<'recording'|'mode'|'files'|'logs'>('recording');
 

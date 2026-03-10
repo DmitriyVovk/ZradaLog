@@ -289,6 +289,58 @@ app.whenReady().then(() => {
     }
   });
 
+  // dedup settings (simple in-memory store for now)
+  let dedupSettings: { algorithm: string; threshold: number } = { algorithm: 'phash', threshold: 12 };
+  ipcMain.handle('zrada:get-dedup-settings', () => {
+    return { ok: true, settings: dedupSettings };
+  });
+  ipcMain.handle('zrada:set-dedup-settings', (_ev, s: any) => {
+    try {
+      dedupSettings.algorithm = s?.algorithm ?? dedupSettings.algorithm;
+      dedupSettings.threshold = typeof s?.threshold === 'number' ? s.threshold : dedupSettings.threshold;
+      logger.info('Dedup settings updated', dedupSettings);
+      return { ok: true, settings: dedupSettings };
+    } catch (e: any) {
+      logger.error('Set dedup settings failed', { err: e?.message });
+      return { ok: false, err: e?.message };
+    }
+  });
+
+  ipcMain.handle('zrada:preview-dedup-scan', async (_ev, opts: any) => {
+    try {
+      const sampleN = Number(opts?.sampleN) || 200;
+      const alg = opts?.algorithm ?? dedupSettings.algorithm;
+      const thr = Number(opts?.threshold ?? dedupSettings.threshold) || dedupSettings.threshold;
+      const imagesDir = path.join(app.getPath('userData'), 'segments', 'images');
+      if (!fs.existsSync(imagesDir)) return { ok: true, total: 0, kept: 0, discarded: 0 };
+      const files = fs.readdirSync(imagesDir).filter(f => /\.(jpe?g|png)$/i.test(f)).sort();
+      const sample = files.slice(Math.max(0, files.length - sampleN));
+
+      // Simple heuristic: group by file size to approximate duplicates
+      const groups: Record<number, string[]> = {};
+      for (const f of sample) {
+        try {
+          const st = fs.statSync(path.join(imagesDir, f));
+          const k = Math.round(st.size / 100); // coarse bucket
+          groups[k] = groups[k] || [];
+          groups[k].push(f);
+        } catch (_) {}
+      }
+      let kept = 0;
+      let discarded = 0;
+      for (const k of Object.keys(groups)) {
+        const arr = groups[Number(k)];
+        if (arr.length > 0) { kept += 1; discarded += arr.length - 1; }
+      }
+      const total = sample.length;
+      logger.info('Preview dedup scan', { algorithm: alg, threshold: thr, total, kept, discarded });
+      return { ok: true, algorithm: alg, threshold: thr, total, kept, discarded, status: 'done' };
+    } catch (e: any) {
+      logger.error('Preview dedup scan failed', { err: e?.message });
+      return { ok: false, err: e?.message };
+    }
+  });
+
   ipcMain.handle('zrada:get-mode', () => {
     try {
       const m = recorder?.getMode ? recorder.getMode() : 'video';

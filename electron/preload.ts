@@ -23,6 +23,10 @@ contextBridge.exposeInMainWorld('zradaControls', {
   getMode: () => ipcRenderer.invoke('zrada:get-mode'),
   setOutputFps: (fps: number) => ipcRenderer.invoke('zrada:set-output-fps', fps),
   getOutputFps: () => ipcRenderer.invoke('zrada:get-output-fps'),
+  // dedup settings
+  getDedupSettings: () => ipcRenderer.invoke('zrada:get-dedup-settings'),
+  setDedupSettings: (s: any) => ipcRenderer.invoke('zrada:set-dedup-settings', s),
+  previewDedupScan: (opts: any) => ipcRenderer.invoke('zrada:preview-dedup-scan', opts),
   subscribeState: (cb: (state: string) => void) => {
     const handler = (_ev: IpcRendererEvent, state: string) => cb(state);
     ipcRenderer.on('zrada:recorder-state', handler);
