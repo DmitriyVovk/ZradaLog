@@ -5,7 +5,7 @@ import fs from 'fs';
 import path from 'path';
 import { app, dialog } from 'electron';
 
-export type RecorderState = 'idle' | 'recording' | 'paused' | 'stopped';
+export type RecorderState = 'idle' | 'recording' | 'paused' | 'stopping' | 'stopped';
 
 export class RecorderEngine extends EventEmitter {
   private logger: LoggerService;
@@ -17,6 +17,7 @@ export class RecorderEngine extends EventEmitter {
   private segments: string[] = [];
   private codec = 'libx264';
   private crf = 23;
+  private mode: 'video' | 'image' = 'video';
 
   constructor(logger: LoggerService) {
     super();
@@ -24,8 +25,18 @@ export class RecorderEngine extends EventEmitter {
     const userData = app.getPath('userData');
     this.segmentsDir = path.join(userData, 'segments');
     if (!fs.existsSync(this.segmentsDir)) fs.mkdirSync(this.segmentsDir, { recursive: true });
+    // ensure image subdir exists for image-sequence mode
+    const imgDir = path.join(this.segmentsDir, 'images');
+    if (!fs.existsSync(imgDir)) fs.mkdirSync(imgDir, { recursive: true });
     this.logger.info('RecorderEngine initialized', { segmentsDir: this.segmentsDir });
   }
+
+  public setMode(mode: 'video' | 'image') {
+    this.mode = mode;
+    this.logger.info('Recorder mode set', { mode });
+  }
+
+  public getMode() { return this.mode; }
 
   public setSegmentInterval(seconds: number) {
     this.segmentIntervalSec = seconds;
@@ -42,8 +53,20 @@ export class RecorderEngine extends EventEmitter {
   }
 
   public getSegments() {
-    try { return fs.readdirSync(this.segmentsDir).map(f => path.join(this.segmentsDir, f)).sort(); }
-    catch { return []; }
+    try {
+      // include top-level video segments and image sequence files
+      const files: string[] = [];
+      const top = fs.readdirSync(this.segmentsDir).map(f => path.join(this.segmentsDir, f));
+      for (const p of top) {
+        const stat = fs.statSync(p);
+        if (stat.isFile()) files.push(p);
+        else if (stat.isDirectory()) {
+          const inner = fs.readdirSync(p).map(f => path.join(p, f));
+          for (const ip of inner) files.push(ip);
+        }
+      }
+      return files.sort();
+    } catch { return []; }
   }
 
   private buildFfmpegArgs(outPattern: string, startNumber = 0) {
@@ -66,6 +89,19 @@ export class RecorderEngine extends EventEmitter {
     return args;
   }
 
+  private buildImageArgs(outPattern: string) {
+    // capture desktop as image sequence
+    const args: string[] = [
+      '-y',
+      '-f', 'gdigrab',
+      '-framerate', String(this.fps),
+      '-i', 'desktop',
+      '-vf', `fps=${this.fps}`,
+      outPattern
+    ];
+    return args;
+  }
+
   private computeNextIndex(fileNames: string[]) {
     let max = -1;
     for (const name of fileNames) {
@@ -83,6 +119,7 @@ export class RecorderEngine extends EventEmitter {
     // ensure segments dir exists
     if (!fs.existsSync(this.segmentsDir)) fs.mkdirSync(this.segmentsDir, { recursive: true });
     const outPattern = path.join(this.segmentsDir, 'segment_%04d.mp4');
+    const outImagePattern = path.join(this.segmentsDir, 'images', 'img_%06d.jpg');
 
     // quick check: is ffmpeg available in PATH?
     try {
@@ -112,8 +149,14 @@ export class RecorderEngine extends EventEmitter {
     this.logger.debug('Existing segments before start', { count: existing.length, files: existingFiles });
     const nextIndex = this.computeNextIndex(existingFiles);
 
-    const args = this.buildFfmpegArgs(outPattern, nextIndex);
-    this.logger.info('Spawning ffmpeg', { args, startIndex: nextIndex });
+    let args: string[];
+    if (this.mode === 'image') {
+      args = this.buildImageArgs(outImagePattern);
+      this.logger.info('Spawning ffmpeg (image-sequence)', { args });
+    } else {
+      args = this.buildFfmpegArgs(outPattern, nextIndex);
+      this.logger.info('Spawning ffmpeg (video)', { args, startIndex: nextIndex });
+    }
 
     this.ff = spawn('ffmpeg', args, { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
 
@@ -125,20 +168,28 @@ export class RecorderEngine extends EventEmitter {
       const s = chunk.toString();
       this.logger.debug('ffmpeg', { stderr: s });
       // detect new segment creation
-      const m = /Opening '(.+segment_\d+\.mp4)' for writing/.exec(s) || /Opening '(.+segment_\d+\.mp4)'/.exec(s);
-      if (m && m[1]) {
-        const file = m[1];
+      // detect new file creation (video segments or image files)
+      const mVideo = /Opening '(.+segment_\d+\.mp4)' for writing/.exec(s) || /Opening '(.+segment_\d+\.mp4)'/.exec(s);
+      const mImage = /Opening '(.+img_\d+\.jpg)' for writing/.exec(s) || /Opening '(.+img_\d+\.jpg)'/.exec(s);
+      if (mVideo && mVideo[1]) {
+        const file = mVideo[1];
         const abs = path.isAbsolute(file) ? file : path.join(this.segmentsDir, path.basename(file));
         this.segments.push(abs);
         this.logger.info('Segment created', { file: abs });
         this.emit('segment', abs);
+      } else if (mImage && mImage[1]) {
+        const file = mImage[1];
+        const abs = path.isAbsolute(file) ? file : path.join(this.segmentsDir, 'images', path.basename(file));
+        this.segments.push(abs);
+        this.logger.info('Image written', { file: abs });
+        this.emit('image', abs);
       }
     });
 
     this.ff.on('close', (code) => {
       this.logger.info('ffmpeg exited', { code });
-      // if recording, treat that as stopped
-      if (this.state === 'recording') {
+      // If ffmpeg closed while recording or stopping, emit final stopped state
+      if (this.state === 'recording' || this.state === 'stopping') {
         this.state = 'stopped';
         this.emit('stopped');
       }
@@ -171,13 +222,14 @@ export class RecorderEngine extends EventEmitter {
   }
 
   public stop() {
-    if (this.state === 'idle' || this.state === 'stopped') return;
+    if (this.state === 'idle' || this.state === 'stopped' || this.state === 'stopping') return;
     if (this.ff && this.ff.stdin.writable) {
       try { this.ff.stdin.write('q'); } catch (_) {}
     }
-    this.state = 'stopped';
-    this.logger.info('Recording stopped');
-    this.emit('stopped');
+    // mark stopping; final 'stopped' will be emitted when ffmpeg process actually exits
+    this.state = 'stopping';
+    this.logger.info('Recording stopping');
+    this.emit('stopping');
   }
 
   public getState() {

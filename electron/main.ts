@@ -1,4 +1,5 @@
 import { app, BrowserWindow, ipcMain, shell } from 'electron';
+import { spawn } from 'child_process';
 import path from 'path';
 import os from 'os';
 import fs from 'fs';
@@ -12,6 +13,7 @@ let recorder: RecorderEngine | null = null;
 let merger: MergerService | null = null;
 let rendererReady = false;
 const pendingLogs: any[] = [];
+let outputFps = 24;
 
 function createWindow() {
   mainWindow = new BrowserWindow({
@@ -75,28 +77,60 @@ app.whenReady().then(() => {
         if (!fs.existsSync(outDir)) fs.mkdirSync(outDir, { recursive: true });
         const outPath = path.join(outDir, formatNowForFilename());
         logger.info('Auto-merge triggered on stop', { count: segs.length, outPath });
-        // obtain recorder FPS (RecorderEngine.getFps returns a number)
+        // obtain recorder FPS
         let inputFpsRaw: any = 1;
         try { inputFpsRaw = recorder?.getFps?.(); } catch (_) { inputFpsRaw = 1; }
-        // coerce possible shapes: number or { ok:true, fps: n }
         let resolvedInputFps = 1;
         if (typeof inputFpsRaw === 'number') resolvedInputFps = inputFpsRaw;
         else if (inputFpsRaw && typeof inputFpsRaw === 'object' && 'fps' in inputFpsRaw) resolvedInputFps = Number((inputFpsRaw as any).fps) || 1;
         else resolvedInputFps = 1;
 
-        merger.mergeSegments(segs, outPath, { inputFps: resolvedInputFps, outputFps: 30 }).then(() => {
-          logger.info('Auto-merge finished', { outPath });
-          if (rendererReady && mainWindow) mainWindow.webContents.send('zrada:merge-done', outPath);
-          // delete segments after successful merge
-          try {
-            for (const s of segs) { try { fs.unlinkSync(s); } catch (_) {} }
-            logger.info('Segments cleaned after merge', { cleaned: segs.length });
-            if (rendererReady && mainWindow) mainWindow.webContents.send('zrada:segments-cleaned');
-          } catch (e: any) { logger.error('Segment cleanup failed', { err: e?.message }); }
-        }).catch((err) => {
-          logger.error('Auto-merge failed', { err: err.message });
-          if (rendererReady && mainWindow) mainWindow.webContents.send('zrada:merge-error', err.message);
-        });
+        // If recorder is in image mode, assemble images into a video
+        try {
+          const mode = (recorder as any).getMode ? (recorder as any).getMode() : 'video';
+          if (mode === 'image') {
+            // assume images are in segments/images/img_%06d.jpg
+            const imagesPattern = path.join(app.getPath('userData'), 'segments', 'images', 'img_%06d.jpg');
+            const args = ['-y', '-framerate', String(outputFps), '-i', imagesPattern, '-c:v', 'libx264', '-pix_fmt', 'yuv420p', outPath];
+            logger.info('Assembling images to video', { args });
+            const ff = spawn('ffmpeg', args, { windowsHide: true });
+            ff.stderr.on('data', (c) => logger.debug('ffmpeg', { stderr: c.toString() }));
+            ff.on('close', (code) => {
+              if (code === 0) {
+                logger.info('Image-assemble finished', { outPath });
+                if (rendererReady && mainWindow) mainWindow.webContents.send('zrada:merge-done', outPath);
+                // cleanup images
+                try {
+                  const imgDir = path.join(app.getPath('userData'), 'segments', 'images');
+                  if (fs.existsSync(imgDir)) {
+                    const files = fs.readdirSync(imgDir);
+                    for (const f of files) { try { fs.unlinkSync(path.join(imgDir, f)); } catch (_) {} }
+                    logger.info('Images cleaned after assemble', { cleaned: files.length });
+                    if (rendererReady && mainWindow) mainWindow.webContents.send('zrada:segments-cleaned');
+                  }
+                } catch (e: any) { logger.error('Images cleanup failed', { err: e?.message }); }
+              } else {
+                logger.error('Image assemble failed', { code });
+                if (rendererReady && mainWindow) mainWindow.webContents.send('zrada:merge-error', `ffmpeg exit ${code}`);
+              }
+            });
+          } else {
+            // default: use MergerService for video segments
+            merger.mergeSegments(segs, outPath, { inputFps: resolvedInputFps, outputFps: 30 }).then(() => {
+              logger.info('Auto-merge finished', { outPath });
+              if (rendererReady && mainWindow) mainWindow.webContents.send('zrada:merge-done', outPath);
+              // delete segments after successful merge
+              try {
+                for (const s of segs) { try { fs.unlinkSync(s); } catch (_) {} }
+                logger.info('Segments cleaned after merge', { cleaned: segs.length });
+                if (rendererReady && mainWindow) mainWindow.webContents.send('zrada:segments-cleaned');
+              } catch (e: any) { logger.error('Segment cleanup failed', { err: e?.message }); }
+            }).catch((err) => {
+              logger.error('Auto-merge failed', { err: err.message });
+              if (rendererReady && mainWindow) mainWindow.webContents.send('zrada:merge-error', err.message);
+            });
+          }
+        } catch (e: any) { logger.error('Auto-merge handler failed', { err: e?.message }); }
       }
     } catch (e: any) {
       logger.error('Auto-merge error', { err: e?.message });
@@ -202,15 +236,65 @@ app.whenReady().then(() => {
       const segDir = path.join(app.getPath('userData'), 'segments');
       let deleted = 0;
       if (fs.existsSync(segDir)) {
-        const files = fs.readdirSync(segDir);
-        for (const f of files) {
-          try { fs.unlinkSync(path.join(segDir, f)); deleted++; } catch (_) {}
+        const items = fs.readdirSync(segDir);
+        for (const it of items) {
+          const p = path.join(segDir, it);
+          try {
+            const st = fs.statSync(p);
+            if (st.isFile()) { try { fs.unlinkSync(p); deleted++; } catch (_) {} }
+            else if (st.isDirectory()) {
+              const inner = fs.readdirSync(p);
+              for (const f of inner) { try { fs.unlinkSync(path.join(p, f)); deleted++; } catch (_) {} }
+            }
+          } catch (_) {}
         }
       }
-      logger.info('Deleted segment files only', { deleted });
+      logger.info('Deleted segment files', { deleted });
       return { ok: true, deleted };
     } catch (e: any) {
       logger.error('Delete all failed', { err: e?.message });
+      return { ok: false, err: e?.message };
+    }
+  });
+
+  ipcMain.handle('zrada:set-output-fps', (_ev, fps: number) => {
+    try {
+      const v = Number(fps) || 24;
+      outputFps = v;
+      logger.info('Output FPS set via IPC', { outputFps: v });
+      return { ok: true, fps: v };
+    } catch (e: any) {
+      logger.error('Set output FPS failed', { err: e?.message });
+      return { ok: false, err: e?.message };
+    }
+  });
+
+  ipcMain.handle('zrada:get-output-fps', () => {
+    try {
+      return { ok: true, fps: outputFps };
+    } catch (e: any) {
+      logger.error('Get output FPS failed', { err: e?.message });
+      return { ok: false, err: e?.message };
+    }
+  });
+
+  ipcMain.handle('zrada:set-mode', (_ev, mode: 'video' | 'image') => {
+    try {
+      recorder?.setMode(mode);
+      logger.info('Recorder mode set via IPC', { mode });
+      return { ok: true, mode };
+    } catch (e: any) {
+      logger.error('Set mode failed', { err: e?.message });
+      return { ok: false, err: e?.message };
+    }
+  });
+
+  ipcMain.handle('zrada:get-mode', () => {
+    try {
+      const m = recorder?.getMode ? recorder.getMode() : 'video';
+      return { ok: true, mode: m };
+    } catch (e: any) {
+      logger.error('Get mode failed', { err: e?.message });
       return { ok: false, err: e?.message };
     }
   });

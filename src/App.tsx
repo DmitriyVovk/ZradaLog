@@ -4,6 +4,8 @@ import LogWindow from './components/LogWindow';
 export const App: React.FC = () => {
   const [state, setState] = React.useState<string>('idle');
   const [fps, setFps] = React.useState<number>(1);
+  const [mode, setMode] = React.useState<'video' | 'image'>('video');
+  const [outputFps, setOutputFps] = React.useState<number>(24);
 
   React.useEffect(() => {
     const init = async () => {
@@ -21,6 +23,18 @@ export const App: React.FC = () => {
       } catch (_) {
         setFps(1);
       }
+      // fetch current mode
+      try {
+        const m = (window as any).zradaControls?.getMode?.();
+        const rm = (typeof m === 'string') ? m : (await m)?.mode;
+        if (rm === 'image' || rm === 'video') setMode(rm);
+      } catch (_) {}
+      // fetch output fps
+      try {
+        const of = (window as any).zradaControls?.getOutputFps?.();
+        const ro = (typeof of === 'number') ? of : (await of)?.fps;
+        if (typeof ro === 'number') setOutputFps(Number(ro) || 24);
+      } catch (_) {}
       // subscribe to state changes
       const unsub = (window as any).zradaControls?.subscribeState?.((st: string) => setState(st));
       return () => { if (typeof unsub === 'function') unsub(); };
@@ -35,6 +49,15 @@ export const App: React.FC = () => {
         <div style={{display:'flex', gap:8}}>
           <div style={{alignSelf:'center', color:'#9fd'}}>{state.toUpperCase()}</div>
           <div style={{display:'flex', alignItems:'center', gap:8}}>
+            <label style={{color:'#9fd', fontSize:12}}>Mode</label>
+            <select value={mode} onChange={async (e) => {
+              const v = (e.target as HTMLSelectElement).value as 'video'|'image';
+              setMode(v);
+              try { await (window as any).zradaControls?.setMode?.(v); } catch (err) { console.error('setMode failed', err); }
+            }} style={{background:'#222',color:'#9fd',border:'1px solid #444',padding:'4px'}}>
+              <option value="video">Video</option>
+              <option value="image">Image</option>
+            </select>
             <label style={{color:'#9fd', fontSize:12}}>FPS</label>
             <input
               type="range"
@@ -54,6 +77,22 @@ export const App: React.FC = () => {
               style={{width:140}}
             />
             <div style={{color:'#9fd', minWidth:40, textAlign:'right'}}>{fps.toFixed(1)} fps</div>
+            <div style={{width:10}} />
+            <label style={{color:'#9fd', fontSize:12}}>Out FPS</label>
+            <input
+              type="range"
+              min={1}
+              max={60}
+              step={1}
+              value={outputFps}
+              onChange={async (e) => {
+                const v = Number((e.target as HTMLInputElement).value);
+                setOutputFps(v);
+                try { await (window as any).zradaControls?.setOutputFps?.(v); } catch (err) { console.error('setOutputFps failed', err); }
+              }}
+              style={{width:140}}
+            />
+            <div style={{color:'#9fd', minWidth:48, textAlign:'right'}}>{outputFps} fps</div>
           </div>
           <button onClick={() => (window as any).zradaControls?.start?.()}>Start</button>
           <button onClick={() => (window as any).zradaControls?.pause?.()}>Pause</button>
