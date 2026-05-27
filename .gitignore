@@ -3,7 +3,9 @@ node_modules/
 
 # build outputs
 dist/
-build/
+dist-electron/
+build/*
+!build/zradalog-icon.ico
 
 electron/dist/
 electron/build/
@@ -16,6 +18,26 @@ electron/build/
 
 # logs
 *.log
+*.logl
+logs/
+
+# generated recordings and media
+*.mp4
+*.mkv
+*.mov
+*.avi
+*.webm
+segments/
+output/
+ffmpeg-session-*.log
+
+# packaged binaries/installers
+*.exe
+*.msi
+*.nupkg
+*.blockmap
+*.7z
+*.zip
 
 # OS
 .DS_Store

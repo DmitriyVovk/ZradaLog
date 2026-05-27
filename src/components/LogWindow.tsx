@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useMemo } from 'react';
+import React, { useState, useMemo } from 'react';
 
 type LogEntry = {
   ts: string;
@@ -7,30 +7,18 @@ type LogEntry = {
   meta?: Record<string, any>;
 };
 
-declare global {
-  interface Window { zradaLogger?: any }
+interface LogWindowProps {
+  logs: LogEntry[];
+  onClearLogs?: () => void;
 }
 
-export const LogWindow: React.FC = () => {
-  const [logs, setLogs] = useState<LogEntry[]>([]);
+export const LogWindow: React.FC<LogWindowProps> = ({ logs, onClearLogs }) => {
   const [levelFilter, setLevelFilter] = useState<string>('debug');
   const [search, setSearch] = useState('');
 
-  useEffect(() => {
-    if (!window.zradaLogger) return;
-    const unsub = window.zradaLogger.subscribe((entry: LogEntry) => {
-      setLogs((s) => {
-        const next = [entry, ...s];
-        if (next.length > 500) next.length = 500; // keep newest 500
-        return next;
-      });
-    });
-    return () => unsub && unsub();
-  }, []);
-
   const clearAll = async () => {
-    // clear UI
-    setLogs([]);
+    // clear UI logs
+    onClearLogs?.();
     // clear disk logs via main
     if ((window as any).zradaAdmin?.clearLogs) {
       try {

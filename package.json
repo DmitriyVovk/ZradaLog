@@ -1,28 +1,64 @@
 {
   "name": "zradalog",
   "version": "0.1.0",
+  "description": "ZradaLog - screen timelapse recorder with auto-merge and deduplication",
+  "author": "Your Name <you@example.com>",
   "private": true,
   "main": "electron/build/main.js",
   "scripts": {
-    "dev": "cross-env NODE_ENV=development concurrently \"vite\" \"wait-on http://localhost:5173 && electron .\"",
-    "build": "vite build",
+    "dev": "cross-env NODE_ENV=development NODE_OPTIONS=--no-deprecation concurrently \"vite\" \"wait-on http://localhost:5173 && electron .\"",
+    "build": "vite build && node scripts/fix-html.js",
     "build:electron": "tsc -p tsconfig.electron.json",
-    "start": "electron ."
+    "start": "cross-env NODE_OPTIONS=--no-deprecation electron .",
+    "dist": "npm run build && npm run build:electron && electron-builder",
+    "dist:win": "npm run build && npm run build:electron && electron-builder --win"
   },
   "dependencies": {
+    "@ffmpeg-installer/ffmpeg": "^1.1.0",
     "electron-store": "^8.1.0",
     "react": "^18.2.0",
     "react-dom": "^18.2.0"
   },
   "devDependencies": {
-    "electron": "^25.0.0",
-    "vite": "^5.0.0",
     "@types/react": "^18.0.0",
     "@types/react-dom": "^18.0.0",
-    "typescript": "^5.0.0",
-    "concurrently": "^8.0.0",
-    "wait-on": "^7.0.0",
     "@vitejs/plugin-react": "^4.0.0",
-    "cross-env": "^7.0.3"
+    "concurrently": "^8.0.0",
+    "cross-env": "^7.0.3",
+    "electron": "^25.0.0",
+    "electron-builder": "^26.8.1",
+    "typescript": "^5.0.0",
+    "vite": "^5.0.0",
+    "wait-on": "^7.0.0"
+  },
+  "build": {
+    "appId": "com.zradalog.app",
+    "productName": "ZradaLog",
+    "icon": "build/zradalog-icon.ico",
+    "directories": {
+      "output": "dist-electron"
+    },
+    "files": [
+      "electron/build/**/*",
+      "dist/**/*",
+      "node_modules/**/*",
+      "package.json"
+    ],
+    "win": {
+      "target": "nsis"
+    },
+    "nsis": {
+      "installerIcon": "build/zradalog-icon.ico",
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "ZradaLog"
+    },
+    "asarUnpack": [
+      "node_modules/@ffmpeg-installer/win32-x64/**/*"
+    ],
+    "afterPack": "scripts/copy-ffmpeg.js"
   }
 }

@@ -1,9 +1,10 @@
-import { spawn } from 'child_process';
+import { spawn, spawnSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 import { promisify } from 'util';
 import { LoggerService } from './LoggerService';
-
+import { getFFmpegPath } from '../utils/ffmpegUtils';
+const FFMPEG_PATH = getFFmpegPath();
 const stat = promisify(fs.stat);
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -32,7 +33,7 @@ async function waitForFileStable(filePath: string, stableMs = 800, timeoutMs = 1
 
 function runFfmpeg(args: string[], opts: { cwd?: string } = {}): Promise<void> {
   return new Promise((resolve, reject) => {
-    const p = spawn('ffmpeg', args, { windowsHide: true, cwd: opts.cwd || undefined });
+    const p = spawn(FFMPEG_PATH, args, { windowsHide: true, cwd: opts.cwd || undefined });
     p.on('error', (err) => reject(err));
     p.on('close', (code) => (code === 0 ? resolve() : reject(new Error(`ffmpeg exit ${code}`))));
   });
@@ -75,19 +76,75 @@ export class MergerService {
     // becomes exactly one output frame at `outputFps`. This avoids long first-frame artifacts.
     const factor = inputFps > 0 ? (outputFps / inputFps) : outputFps;
     const trimSeconds = 0; // trimming not used when reassigning PTS by frame index
-    // wait for files to stabilize on disk (avoid merging while ffmpeg still finalizes)
+    // Filter out empty or trivially-small segment files before merging to avoid ffmpeg concat errors
+    const MIN_SEGMENT_BYTES = 2048; // skip files smaller than ~2KiB
+    const valid: string[] = [];
+    const skipped: Array<{ file: string; size: number; reason?: string }> = [];
     for (const s of ordered) {
       try {
-        await waitForFileStable(s);
+        const st = await stat(s);
+        if (st.size < MIN_SEGMENT_BYTES) {
+          skipped.push({ file: s, size: st.size, reason: 'size' });
+          continue;
+        }
+        // Prefer to use ffprobe to ensure the file actually contains playable video frames.
+        // If ffprobe is unavailable or fails, fall back to size-based acceptance.
+        let probed: { status: number | null; stdout: string } | null = null;
+        try {
+          const out = spawnSync('ffprobe', ['-v', 'error', '-show_entries', 'format=duration', '-of', 'default=nokey=1:noprint_wrappers=1', s], { encoding: 'utf8', windowsHide: true });
+          probed = { status: out.status ?? null, stdout: out.stdout ?? '' };
+        } catch (_) {
+          probed = null;
+        }
+
+        if (probed && probed.status === 0) {
+          const dur = Number((probed.stdout || '').trim());
+          if (!isNaN(dur) && dur > 0) {
+            valid.push(s);
+          } else {
+            skipped.push({ file: s, size: st.size, reason: 'ffprobe-duration-zero' });
+          }
+        } else if (probed) {
+          // ffprobe returned error (likely corrupt segment: missing moov, bad container)
+          skipped.push({ file: s, size: st.size, reason: 'ffprobe-invalid-file' });
+        } else {
+          // ffprobe not available (e.g., missing ffprobe binary), then fallback to size-based acceptance
+          this.logger.warn('ffprobe unavailable: using size fallback', { file: s, size: st.size });
+          valid.push(s);
+        }
       } catch (e) {
-        this.logger.warn('File did not stabilize before merge, proceeding anyway', { file: s, err: (e as Error).message });
+        // file missing or unreadable -> treat as skipped
+        skipped.push({ file: s, size: 0, reason: 'stat-failed' });
       }
     }
 
-    // If only one segment, remux it first (fast, no re-encode) to ensure container is well-formed,
+    if (skipped.length > 0) this.logger.warn('Skipping empty/small segments before merge', { skipped });
+
+    if (valid.length === 0) {
+      // try to provide helpful diagnostic: look for ffmpeg logs near the first segment
+      let ffmpegLog: string | null = null;
+      try {
+        const firstDir = path.dirname(ordered[0] || outPath);
+        const files = fs.readdirSync(firstDir).filter(f => /^ffmpeg-.*\.log$/.test(f));
+        if (files.length > 0) {
+          files.sort((a, b) => {
+            const sa = fs.statSync(path.join(firstDir, a)).mtime.getTime();
+            const sb = fs.statSync(path.join(firstDir, b)).mtime.getTime();
+            return sa - sb;
+          });
+          ffmpegLog = path.join(firstDir, files[files.length - 1]);
+        }
+      } catch (_) {}
+
+      const msg = `No valid segments to merge (all segments empty or too small). Skipped ${skipped.length} files.` + (ffmpegLog ? ` See ffmpeg log: ${ffmpegLog}` : '');
+      this.logger.error('Merge aborted: no valid segments', { skipped, ffmpegLog });
+      throw new Error(msg);
+    }
+
+    // If only one valid segment, remux it first (fast, no re-encode) to ensure container is well-formed,
     // then re-encode with per-frame PTS assignment.
-    if (ordered.length === 1) {
-      const orig = ordered[0];
+    if (valid.length === 1) {
+      const orig = valid[0];
       const tmpRemux = path.join(path.dirname(orig), `${path.basename(orig, path.extname(orig))}.remux${path.extname(orig)}`);
       try {
         // remux copy to ensure moov atom and proper container
@@ -120,9 +177,9 @@ export class MergerService {
       }
     }
 
-    // Multiple segments: build concat list
+    // Multiple valid segments: build concat list using filtered valid files
     const escapeForList = (p: string) => p.replace(/'/g, "'\\''");
-    const contents = ordered.map(s => `file '${escapeForList(s)}'`).join('\n');
+    const contents = valid.map(s => `file '${escapeForList(s)}'`).join('\n');
     fs.writeFileSync(listFile, contents, { encoding: 'utf8' });
 
     return new Promise((resolve, reject) => {
@@ -136,7 +193,7 @@ export class MergerService {
         '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23',
         outPath
       ];
-      const ff = spawn('ffmpeg', args, { windowsHide: true });
+      const ff = spawn(FFMPEG_PATH, args, { windowsHide: true });
 
       ff.stderr.on('data', (chunk) => {
         this.logger.debug('ffmpeg', { stderr: chunk.toString() });
@@ -146,14 +203,33 @@ export class MergerService {
         try { fs.unlinkSync(listFile); } catch (_) {}
         if (code === 0) {
           // cleanup original segments after successful merge
-          for (const s of ordered) {
+          for (const s of valid) {
             try { fs.unlinkSync(s); } catch (_) {}
           }
-          this.logger.info('Merge complete', { outPath });
+          // also try to remove skipped small files (best effort)
+          for (const s of skipped.map(x => x.file)) {
+            try { fs.unlinkSync(s); } catch (_) {}
+          }
+          this.logger.info('Merge complete', { outPath, mergedCount: valid.length, skippedCount: skipped.length });
           resolve();
         } else {
-          this.logger.error('Merge failed', { code });
-          reject(new Error(`ffmpeg exited with ${code}`));
+          this.logger.error('Merge failed', { code, mergedCount: valid.length, skippedCount: skipped.length });
+          // try to help by pointing to latest ffmpeg log if present
+          let ffmpegLog: string | null = null;
+          try {
+            const firstDir = path.dirname(valid[0] || ordered[0] || outPath);
+            const files = fs.readdirSync(firstDir).filter(f => /^ffmpeg-.*\.log$/.test(f));
+            if (files.length > 0) {
+              files.sort((a, b) => {
+                const sa = fs.statSync(path.join(firstDir, a)).mtime.getTime();
+                const sb = fs.statSync(path.join(firstDir, b)).mtime.getTime();
+                return sa - sb;
+              });
+              ffmpegLog = path.join(firstDir, files[files.length - 1]);
+            }
+          } catch (_) {}
+          const errMsg = `ffmpeg exited with ${code}` + (ffmpegLog ? `; see ${ffmpegLog}` : '');
+          reject(new Error(errMsg));
         }
       });
 
