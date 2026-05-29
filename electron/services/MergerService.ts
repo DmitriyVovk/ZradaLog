@@ -7,6 +7,7 @@ import { getFFmpegPath } from '../utils/ffmpegUtils';
 const FFMPEG_PATH = getFFmpegPath();
 const stat = promisify(fs.stat);
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+const FFMPEG_PROGRESS_LOG_INTERVAL_MS = 5000;
 
 async function waitForFileStable(filePath: string, stableMs = 800, timeoutMs = 15000) {
   const start = Date.now();
@@ -31,9 +32,41 @@ async function waitForFileStable(filePath: string, stableMs = 800, timeoutMs = 1
   throw new Error(`file did not stabilize in ${timeoutMs}ms: ${filePath}`);
 }
 
-function runFfmpeg(args: string[], opts: { cwd?: string } = {}): Promise<void> {
+function lowerProcessPriority(pid?: number, logger?: LoggerService) {
+  if (process.platform !== 'win32' || !pid) return;
+  try {
+    const result = spawnSync('powershell.exe', [
+      '-NoProfile',
+      '-ExecutionPolicy',
+      'Bypass',
+      '-Command',
+      `$p = Get-Process -Id ${pid} -ErrorAction SilentlyContinue; if ($p) { $p.PriorityClass = 'BelowNormal' }`,
+    ], { encoding: 'utf8', windowsHide: true });
+    if (result.status === 0) {
+      logger?.info('Lowered merge ffmpeg priority', { pid, priority: 'BelowNormal' });
+    } else {
+      logger?.warn('Failed to lower merge ffmpeg priority', {
+        pid,
+        status: result.status,
+        stderr: result.stderr,
+      });
+    }
+  } catch (e) {
+    logger?.warn('Failed to lower merge ffmpeg priority', {
+      pid,
+      err: (e as Error).message,
+    });
+  }
+}
+
+function isFfmpegProgress(text: string) {
+  return /(^|\r|\n)\s*frame=\s*\d+/m.test(text);
+}
+
+function runFfmpeg(args: string[], opts: { cwd?: string, logger?: LoggerService } = {}): Promise<void> {
   return new Promise((resolve, reject) => {
     const p = spawn(FFMPEG_PATH, args, { windowsHide: true, cwd: opts.cwd || undefined });
+    lowerProcessPriority(p.pid, opts.logger);
     p.on('error', (err) => reject(err));
     p.on('close', (code) => (code === 0 ? resolve() : reject(new Error(`ffmpeg exit ${code}`))));
   });
@@ -148,7 +181,7 @@ export class MergerService {
       const tmpRemux = path.join(path.dirname(orig), `${path.basename(orig, path.extname(orig))}.remux${path.extname(orig)}`);
       try {
         // remux copy to ensure moov atom and proper container
-        await runFfmpeg(['-y', '-i', orig, '-c', 'copy', tmpRemux]);
+        await runFfmpeg(['-y', '-i', orig, '-c', 'copy', tmpRemux], { logger: this.logger });
       } catch (e) {
         this.logger.error('Remux failed for single segment', { file: orig, err: (e as Error).message });
         throw e;
@@ -164,7 +197,7 @@ export class MergerService {
           '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23',
           outPath
         ];
-        await runFfmpeg(args);
+        await runFfmpeg(args, { logger: this.logger });
         this.logger.info('Merge complete (single)', { outPath });
         // cleanup originals and tmp
         try { fs.unlinkSync(orig); } catch (_) {}
@@ -194,9 +227,19 @@ export class MergerService {
         outPath
       ];
       const ff = spawn(FFMPEG_PATH, args, { windowsHide: true });
+      lowerProcessPriority(ff.pid, this.logger);
+      let lastProgressLogAt = 0;
 
       ff.stderr.on('data', (chunk) => {
-        this.logger.debug('ffmpeg', { stderr: chunk.toString() });
+        const stderr = chunk.toString();
+        if (isFfmpegProgress(stderr)) {
+          const now = Date.now();
+          if (now - lastProgressLogAt < FFMPEG_PROGRESS_LOG_INTERVAL_MS) return;
+          lastProgressLogAt = now;
+          this.logger.debug('ffmpeg progress', { stderr });
+          return;
+        }
+        this.logger.debug('ffmpeg', { stderr });
       });
 
       ff.on('close', (code) => {

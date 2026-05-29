@@ -15,6 +15,7 @@ const FFMPEG_PATH = getFFmpegPath();
 const BATCH_SIZE = 10;
 const MAX_PENDING = 100;
 const RETRY_POLICY_MS = [100, 300, 900];
+const FFMPEG_PROGRESS_DIAG_INTERVAL_MS = 30000;
 
 export type RecorderState =
   | "idle"
@@ -31,6 +32,7 @@ export class RecorderEngine extends EventEmitter {
   private ff?: ChildProcessWithoutNullStreams;
   private segmentsDir: string;
   private segments: string[] = [];
+  private sessionSegments: string[] = [];
   private imageWatcher?: fs.FSWatcher;
   private emittedImages: Set<string> = new Set();
   private emittedTmp: Set<string> = new Set();
@@ -78,6 +80,13 @@ export class RecorderEngine extends EventEmitter {
   private sessionLogPath: string | null = null;
   private sessionLogStream: fs.WriteStream | null = null;
   private sessionLogMaxFiles = 10;
+  private ffmpegSpawnedAtMs = 0;
+  private lastSegmentSeenAtMs: number | null = null;
+  private lastSegmentIndex: number | null = null;
+  private progressDiagLastAtMs = 0;
+  private currentSessionStartIndex = 0;
+  private currentPreviousCompressedSec = 0;
+  private currentSessionStartStr = "";
 
   constructor(logger: LoggerService) {
     super();
@@ -184,6 +193,10 @@ export class RecorderEngine extends EventEmitter {
     }
   }
 
+  public getSessionSegments() {
+    return this.sessionSegments.slice().sort();
+  }
+
   public getLastFfmpegExitCode() {
     return this.lastFfmpegExitCode;
   }
@@ -198,6 +211,7 @@ export class RecorderEngine extends EventEmitter {
     skipDedup = false,
     outputFps = 30,
     previousCompressedSec = 0,
+    previousWallSec = 0,
     sessionStartStr = "",
   ) {
     const args: string[] = [
@@ -244,38 +258,16 @@ export class RecorderEngine extends EventEmitter {
         const hi = Number(this.mpdecimateSettings.hi) || 20000;
         const lo = Number(this.mpdecimateSettings.lo) || 1500;
         const frac = Number(this.mpdecimateSettings.frac) || 0.3;
-        // Overlay (single drawtext after setpts):
-        //   mpdecimate -> settb -> setpts=N/(fps*TB) -> fps -> format -> [dt]
-        //
-        //   After setpts: t = N/outputFps = compressed video time (secs).
-        //   Only ACCEPTED frames (passed by mpdecimate) increment N,
-        //   so t ticks only when the screen is actually changing.
-        //
-        //   Format (single yellow line, bottom-centre):
-        //     Work From YYYY-MM-DD HH:MM To YYYY-MM-DD HH:MM | Total HH:MM | Compressed HH:MM:SS
-        //
-        //   Total      = (t + previousCompressedSec) * ratio
-        //                ratio = outputFps/inputFps (e.g. 15/0.5 = 30)
-        //                = wall-clock seconds of screen activity
-        //                  (each compressed frame = 1/inputFps real secs of change)
-        //   Compressed = t + previousCompressedSec  (video file playback duration)
-
-        const inputFps = this.fps > 0 ? this.fps : 1;
-        // Each compressed second represents outputFps/inputFps seconds of
-        // accepted screen activity. E.g. inputFps=0.5 and outputFps=15 => 30.
-        const ratio = outputFps / inputFps;
+        // Overlay is drawn before setpts so Total uses the original capture
+        // timeline. Compressed is derived from accepted frame count.
         const prevCompSec = Math.max(0, previousCompressedSec);
+        const prevWall = Math.max(0, previousWallSec);
 
-        // Escaped-colon helpers for drawtext text='...' context.
-        //   hm  = HH:MM       (no seconds - Total)
-        //   hms = HH:MM:SS    (with seconds - Compressed)
-        const hm = (V: string) =>
-          `%{eif\\:(${V})/3600\\:d\\:2}` +
-          `\\:%{eif\\:mod((${V})/60,60)\\:d\\:2}`;
-        const hms = (V: string) => hm(V) + `\\:%{eif\\:mod((${V}),60)\\:d\\:2}`;
-
-        const cV = `t+${prevCompSec}`; // compressed time expression
-        const wV = `(${cV})*${ratio}`; // activity time expression
+        const totalSecV = `t+${prevWall}`;
+        const compressedSecV = `(n/${outputFps})+${prevCompSec}`;
+        const totalH = `%{eif\\:(${totalSecV})/3600\\:d}`;
+        const totalM = `%{eif\\:mod((${totalSecV})/60,60)\\:d\\:2}`;
+        const compressedSec = `%{eif\\:${compressedSecV}\\:d}`;
 
         // Current date-time via separate localtime calls (avoids colon-in-format issues).
         const startLabel = sessionStartStr || "????-??-?? ??\\:??";
@@ -284,8 +276,8 @@ export class RecorderEngine extends EventEmitter {
 
         const overlayText =
           `Work From ${startLabel} To ${curDate} ${curHM}` +
-          ` | Total ${hm(wV)}` +
-          ` | Compressed ${hms(cV)}`;
+          ` | Total ${totalH}h ${totalM}m` +
+          ` | Compressed ${compressedSec} sec`;
 
         const dt =
           `drawtext=font='Arial'` +
@@ -294,11 +286,11 @@ export class RecorderEngine extends EventEmitter {
 
         const vf = [
           `mpdecimate=hi=${hi}:lo=${lo}:frac=${frac}`,
+          dt,
           `settb=AVTB`,
           `setpts=N/(${outputFps}*TB)`,
           `fps=${outputFps}`,
           `format=yuv420p`,
-          dt,
         ].join(",");
 
         // Insert before the segment muxer (-f segment)
@@ -320,8 +312,8 @@ export class RecorderEngine extends EventEmitter {
         );
         this.logger.info("Applied overlay filter", {
           mpdecimate: { hi, lo, frac },
-          ratio,
           prevCompSec,
+          prevWallSec: prevWall,
           sessionStartStr,
           outputFps,
         });
@@ -364,6 +356,60 @@ export class RecorderEngine extends EventEmitter {
     return max + 1;
   }
 
+  private extractSegmentIndex(file: string) {
+    const m = path.basename(file).match(/^segment_(\d+)\.mp4$/i);
+    if (!m) return null;
+    const index = parseInt(m[1], 10);
+    return Number.isFinite(index) ? index : null;
+  }
+
+  private parseFfmpegProgress(text: string) {
+    const frameMatches = [...text.matchAll(/frame=\s*(\d+)/g)];
+    const fpsMatches = [...text.matchAll(/fps=\s*([0-9.]+)/g)];
+    const timeMatches = [...text.matchAll(/time=(\d+):(\d+):(\d+(?:\.\d+)?)/g)];
+    const speedMatches = [...text.matchAll(/speed=\s*([0-9.]+)x/g)];
+    const frameMatch = frameMatches[frameMatches.length - 1];
+    const fpsMatch = fpsMatches[fpsMatches.length - 1];
+    const timeMatch = timeMatches[timeMatches.length - 1];
+    const speedMatch = speedMatches[speedMatches.length - 1];
+    let outTimeSec: number | null = null;
+    if (timeMatch) {
+      const hours = Number(timeMatch[1]);
+      const minutes = Number(timeMatch[2]);
+      const seconds = Number(timeMatch[3]);
+      if (
+        Number.isFinite(hours) &&
+        Number.isFinite(minutes) &&
+        Number.isFinite(seconds)
+      ) {
+        outTimeSec = hours * 3600 + minutes * 60 + seconds;
+      }
+    }
+    return {
+      frame: frameMatch ? Number(frameMatch[1]) : null,
+      fps: fpsMatch ? Number(fpsMatch[1]) : null,
+      outTimeSec,
+      speed: speedMatch ? Number(speedMatch[1]) : null,
+    };
+  }
+
+  private getFileDiag(file: string) {
+    try {
+      const st = fs.statSync(file);
+      return {
+        exists: true,
+        size: st.size,
+        birthtime: st.birthtime.toISOString(),
+        mtime: st.mtime.toISOString(),
+      };
+    } catch (e: any) {
+      return {
+        exists: false,
+        err: e?.message,
+      };
+    }
+  }
+
   private getCompletedSegmentDurationSec(nextIndex: number) {
     let total = 0;
     try {
@@ -385,6 +431,27 @@ export class RecorderEngine extends EventEmitter {
       this.logger.warn("Failed to compute prior compressed duration", {
         err: e?.message,
       });
+    }
+    return total;
+  }
+
+  private getSegmentDurationTotalSec(files: string[]) {
+    let total = 0;
+    for (const file of files) {
+      const seconds = this.probeDurationSec(file);
+      if (Number.isFinite(seconds) && seconds > 0) total += seconds;
+    }
+    return total;
+  }
+
+  private getSegmentWallDurationTotalSec(files: string[]) {
+    let total = 0;
+    for (const file of files) {
+      try {
+        const st = fs.statSync(file);
+        const seconds = (st.mtime.getTime() - st.birthtime.getTime()) / 1000;
+        if (Number.isFinite(seconds) && seconds > 0) total += seconds;
+      } catch (_) {}
     }
     return total;
   }
@@ -413,6 +480,29 @@ export class RecorderEngine extends EventEmitter {
       return new Date(startMs);
     } catch (e: any) {
       this.logger.warn("Failed to compute first segment start", {
+        err: e?.message,
+      });
+      return null;
+    }
+  }
+
+  private getFirstSegmentStartFromFiles(files: string[]) {
+    try {
+      const first = files
+        .filter((file) => /^segment_\d+\.mp4$/i.test(path.basename(file)))
+        .sort((a, b) => {
+          const ai = this.extractSegmentIndex(a) ?? Number.POSITIVE_INFINITY;
+          const bi = this.extractSegmentIndex(b) ?? Number.POSITIVE_INFINITY;
+          return ai - bi;
+        })[0];
+      if (!first) return null;
+
+      const stat = fs.statSync(first);
+      const durationMs = this.probeDurationSec(first) * 1000;
+      const startMs = stat.mtime.getTime() - Math.max(0, durationMs);
+      return new Date(startMs);
+    } catch (e: any) {
+      this.logger.warn("Failed to compute first session segment start", {
         err: e?.message,
       });
       return null;
@@ -636,6 +726,7 @@ export class RecorderEngine extends EventEmitter {
 
     const isResuming = this.state === "paused";
     if (!isResuming) {
+      this.sessionSegments = [];
       this.openSessionLog();
     } else {
       this.writeSessionLog(`[SESSION RESUME] ${new Date().toISOString()}\n`);
@@ -671,6 +762,12 @@ export class RecorderEngine extends EventEmitter {
     }
 
     const nextIndex = this.computeNextIndex(filesForIndex);
+    this.currentSessionStartIndex = nextIndex;
+    this.currentPreviousCompressedSec = 0;
+    this.currentSessionStartStr = "";
+    this.lastSegmentSeenAtMs = null;
+    this.lastSegmentIndex = null;
+    this.progressDiagLastAtMs = 0;
 
     let args: string[];
     if (this.mode === "image") {
@@ -813,26 +910,45 @@ export class RecorderEngine extends EventEmitter {
       this.logger.info("Spawning ffmpeg (image-sequence)", { args });
     } else {
       // video mode: do not do automatic skip/restart; skipDedup currently unused in new flow
-      const previousCompressedSec =
-        this.getCompletedSegmentDurationSec(nextIndex);
+      const previousCompressedSec = isResuming
+        ? this.getSegmentDurationTotalSec(this.sessionSegments)
+        : 0;
+      const previousWallSec = isResuming
+        ? this.getSegmentWallDurationTotalSec(this.sessionSegments)
+        : 0;
       // Session start time embedded into the Clock overlay ("YYYY-MM-DD HH:MM").
       // The colon in HH:MM is pre-escaped as \: so drawtext renders it as ':'
       // without misinterpreting it as a filter-option separator.
-      const sessionStart =
-        this.getFirstCompletedSegmentStart(nextIndex) || new Date();
+      const sessionStart = isResuming
+        ? this.getFirstSegmentStartFromFiles(this.sessionSegments) || new Date()
+        : new Date();
       const sessionStartStr = this.formatOverlayDateTime(sessionStart);
+      this.currentPreviousCompressedSec = previousCompressedSec;
+      this.currentSessionStartStr = sessionStartStr;
       args = this.buildFfmpegArgs(
         outPattern,
         nextIndex,
         false,
         this.outputFps,
         previousCompressedSec,
+        previousWallSec,
         sessionStartStr,
       );
       this.logger.info("Spawning ffmpeg (video)", {
         args,
         startIndex: nextIndex,
         previousCompressedSec,
+        previousWallSec,
+        sessionSegmentCount: this.sessionSegments.length,
+        segmentIntervalSec: this.segmentIntervalSec,
+        captureFps: this.fps,
+        outputFps: this.outputFps,
+        expectedInputFramesPerSegment: this.segmentIntervalSec * this.outputFps,
+        expectedWallSecPerSegmentAtCaptureFps:
+          this.fps > 0
+            ? (this.segmentIntervalSec * this.outputFps) / this.fps
+            : null,
+        sessionStartStr,
       });
     }
 
@@ -846,10 +962,19 @@ export class RecorderEngine extends EventEmitter {
       stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true,
     });
+    this.ffmpegSpawnedAtMs = Date.now();
     this.lowerProcessPriority(this.ff.pid);
 
     this.state = "recording";
-    this.logger.info("Recording started");
+    this.logger.info("Recording started", {
+      pid: this.ff.pid,
+      mode: this.mode,
+      startIndex: nextIndex,
+      segmentIntervalSec: this.segmentIntervalSec,
+      captureFps: this.fps,
+      outputFps: this.outputFps,
+      sessionLogPath: this.sessionLogPath,
+    });
     this.emit("started");
 
     try {
@@ -883,6 +1008,30 @@ export class RecorderEngine extends EventEmitter {
       const videoRe = /Opening '(.+segment_\d+\.mp4)(?:' for writing)?/g;
       const imageRe =
         /Opening '(.+img_\d+\.(?:jpg|jpeg|png))(?:' for writing)?/g;
+      const progress = this.parseFfmpegProgress(s);
+      const now = Date.now();
+      if (
+        progress.frame !== null &&
+        now - this.progressDiagLastAtMs >= FFMPEG_PROGRESS_DIAG_INTERVAL_MS
+      ) {
+        this.progressDiagLastAtMs = now;
+        this.logger.debug("ffmpeg progress diagnostic", {
+          pid: this.ff?.pid,
+          elapsedSec:
+            this.ffmpegSpawnedAtMs > 0
+              ? Math.round((now - this.ffmpegSpawnedAtMs) / 1000)
+              : null,
+          frame: progress.frame,
+          fps: progress.fps,
+          outTimeSec: progress.outTimeSec,
+          speed: progress.speed,
+          mode: this.mode,
+          startIndex: this.currentSessionStartIndex,
+          segmentIntervalSec: this.segmentIntervalSec,
+          captureFps: this.fps,
+          outputFps: this.outputFps,
+        });
+      }
       let mVideo: RegExpExecArray | null;
       let mImage: RegExpExecArray | null;
       while ((mVideo = videoRe.exec(s)) !== null) {
@@ -890,8 +1039,43 @@ export class RecorderEngine extends EventEmitter {
         const abs = path.isAbsolute(file)
           ? file
           : path.join(this.segmentsDir, path.basename(file));
+        const segmentIndex = this.extractSegmentIndex(abs);
+        const previousSeenAt = this.lastSegmentSeenAtMs;
+        const previousIndex = this.lastSegmentIndex;
+        const alreadyKnown = this.segments.includes(abs);
+        const alreadyKnownInSession = this.sessionSegments.includes(abs);
         this.segments.push(abs);
-        this.logger.info("Segment created", { file: abs });
+        if (!alreadyKnownInSession) this.sessionSegments.push(abs);
+        this.lastSegmentSeenAtMs = now;
+        this.lastSegmentIndex = segmentIndex;
+        this.logger.info("Segment created", {
+          file: abs,
+          segmentIndex,
+          previousIndex,
+          duplicateInMemory: alreadyKnown,
+          duplicateInSession: alreadyKnownInSession,
+          segmentsInMemory: this.segments.length,
+          sessionSegmentsInMemory: this.sessionSegments.length,
+          elapsedSec:
+            this.ffmpegSpawnedAtMs > 0
+              ? Math.round((now - this.ffmpegSpawnedAtMs) / 1000)
+              : null,
+          deltaFromPreviousSegmentSec:
+            previousSeenAt !== null
+              ? Math.round((now - previousSeenAt) / 1000)
+              : null,
+          progressFrame: progress.frame,
+          progressFps: progress.fps,
+          progressOutTimeSec: progress.outTimeSec,
+          progressSpeed: progress.speed,
+          segmentIntervalSec: this.segmentIntervalSec,
+          captureFps: this.fps,
+          outputFps: this.outputFps,
+          startIndex: this.currentSessionStartIndex,
+          previousCompressedSec: this.currentPreviousCompressedSec,
+          sessionStartStr: this.currentSessionStartStr,
+          fileDiag: this.getFileDiag(abs),
+        });
         this.emit("segment", abs);
       }
       while ((mImage = imageRe.exec(s)) !== null) {
@@ -902,6 +1086,7 @@ export class RecorderEngine extends EventEmitter {
         if (!this.emittedImages.has(abs)) {
           this.emittedImages.add(abs);
           this.segments.push(abs);
+          if (!this.sessionSegments.includes(abs)) this.sessionSegments.push(abs);
           this.logger.info("Image written (stderr)", { file: abs });
           this.emit("image", abs);
         }
@@ -929,6 +1114,7 @@ export class RecorderEngine extends EventEmitter {
     });
 
     this.ff.on("close", (code) => {
+      const closeAt = Date.now();
       this.lastFfmpegExitCode = code;
       if (code !== 0 && code !== null) {
         this.lastFfmpegErrorTail = this.ffmpegLastStderr.slice(-15).join(" | ");
@@ -939,7 +1125,17 @@ export class RecorderEngine extends EventEmitter {
           stderrTail: this.lastFfmpegErrorTail,
         });
       } else {
-        this.logger.info("ffmpeg exited", { code });
+        this.logger.info("ffmpeg exited", {
+          code,
+          pid: this.ff?.pid,
+          elapsedSec:
+            this.ffmpegSpawnedAtMs > 0
+              ? Math.round((closeAt - this.ffmpegSpawnedAtMs) / 1000)
+              : null,
+          segmentsInMemory: this.segments.length,
+          sessionSegmentsInMemory: this.sessionSegments.length,
+          lastSegmentIndex: this.lastSegmentIndex,
+        });
       }
       this.ffmpegLastStderr = [];
       this.writeSessionLog(
@@ -1002,14 +1198,35 @@ export class RecorderEngine extends EventEmitter {
   }
 
   public stop() {
+    const stopRequestedAt = Date.now();
     if (
       this.state === "idle" ||
       this.state === "stopped" ||
       this.state === "stopping"
-    )
+    ) {
+      this.logger.info("Stop ignored", {
+        state: this.state,
+        hasFfmpeg: Boolean(this.ff),
+        pid: this.ff?.pid,
+      });
       return;
+    }
 
     this.writeSessionLog(`[SESSION STOP] ${new Date().toISOString()}\n`);
+    this.logger.info("Stop requested", {
+      state: this.state,
+      hasFfmpeg: Boolean(this.ff),
+      pid: this.ff?.pid,
+      ffmpegStdinWritable: Boolean(this.ff?.stdin?.writable),
+      elapsedSec:
+        this.ffmpegSpawnedAtMs > 0
+          ? Math.round((stopRequestedAt - this.ffmpegSpawnedAtMs) / 1000)
+          : null,
+      segmentsInMemory: this.segments.length,
+      sessionSegmentsInMemory: this.sessionSegments.length,
+      lastSegmentIndex: this.lastSegmentIndex,
+      pendingPromotions: this.pendingPromotions.length,
+    });
 
     if (this.state === "paused" && !this.ff) {
       this.logger.info(
@@ -1040,6 +1257,10 @@ export class RecorderEngine extends EventEmitter {
     if (this.ff && this.ff.stdin.writable) {
       try {
         this.ff.stdin.write("q");
+        this.logger.info("Stop signal sent to ffmpeg stdin", {
+          pid: this.ff.pid,
+          signal: "q",
+        });
       } catch (_) {}
     }
     this.state = "stopping";
@@ -1056,7 +1277,15 @@ export class RecorderEngine extends EventEmitter {
       try {
         if (this.ff) {
           try {
-            this.logger.warn("ffmpeg did not exit in time, force killing");
+            this.logger.warn("ffmpeg did not exit in time, force killing", {
+              pid: this.ff.pid,
+              elapsedSinceStopSec: Math.round(
+                (Date.now() - stopRequestedAt) / 1000,
+              ),
+              segmentsInMemory: this.segments.length,
+              sessionSegmentsInMemory: this.sessionSegments.length,
+              lastSegmentIndex: this.lastSegmentIndex,
+            });
           } catch (_) {}
           try {
             this.ff.kill();
@@ -1166,6 +1395,8 @@ export class RecorderEngine extends EventEmitter {
         try {
           this.emittedImages.add(item.dest);
           this.segments.push(item.dest);
+          if (!this.sessionSegments.includes(item.dest))
+            this.sessionSegments.push(item.dest);
           this.logger.info("batch-promotion-done", { file: item.dest });
           try {
             this.emit("image", item.dest);

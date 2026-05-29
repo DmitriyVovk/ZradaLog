@@ -95,6 +95,8 @@ let rendererReady = false;
 const pendingLogs: any[] = [];
 let outputFps = 24;
 let savedCount = 0;
+const AUTO_MERGE_MAX_VIDEO_BYTES = 1536 * 1024 * 1024;
+const AUTO_MERGE_MAX_VIDEO_SEGMENTS = 16;
 // Flag: was recording auto-paused by sleep event (vs manual pause by user)
 let sleepPausedRec = false;
 // Flag: Windows screen is currently locked (gdigrab cannot access desktop while locked)
@@ -236,6 +238,84 @@ function checkActiveCaptureProcesses() {
   } catch (e) {
     return [];
   }
+}
+
+function getFilesStats(files: string[]) {
+  let existing = 0;
+  let totalBytes = 0;
+  const missing: string[] = [];
+  for (const file of files) {
+    try {
+      const st = fs.statSync(file);
+      if (st.isFile()) {
+        existing += 1;
+        totalBytes += st.size;
+      }
+    } catch (_) {
+      missing.push(file);
+    }
+  }
+  return { existing, totalBytes, missing };
+}
+
+function summarizeSegmentFiles(files: string[]) {
+  const items = files
+    .map((file) => {
+      try {
+        const st = fs.statSync(file);
+        return {
+          file,
+          name: path.basename(file),
+          ext: path.extname(file).toLowerCase(),
+          size: st.size,
+          birthtimeMs: st.birthtime.getTime(),
+          mtimeMs: st.mtime.getTime(),
+          birthtime: st.birthtime.toISOString(),
+          mtime: st.mtime.toISOString(),
+        };
+      } catch (e: any) {
+        return {
+          file,
+          name: path.basename(file),
+          ext: path.extname(file).toLowerCase(),
+          size: 0,
+          birthtimeMs: 0,
+          mtimeMs: 0,
+          birthtime: null,
+          mtime: null,
+          err: e?.message,
+        };
+      }
+    })
+    .sort((a, b) => a.name.localeCompare(b.name));
+  const mp4Items = items.filter((item) => item.ext === ".mp4");
+  const totalBytes = mp4Items.reduce((sum, item) => sum + item.size, 0);
+  const byMtime = mp4Items
+    .filter((item) => item.mtimeMs > 0)
+    .slice()
+    .sort((a, b) => a.mtimeMs - b.mtimeMs);
+  const first = byMtime[0] || null;
+  const last = byMtime[byMtime.length - 1] || null;
+  return {
+    totalInputFiles: items.length,
+    mp4Count: mp4Items.length,
+    nonMp4Count: items.length - mp4Items.length,
+    totalMp4Bytes: totalBytes,
+    firstMp4: first
+      ? { name: first.name, size: first.size, mtime: first.mtime }
+      : null,
+    lastMp4: last ? { name: last.name, size: last.size, mtime: last.mtime } : null,
+    mp4MtimeSpanSec:
+      first && last ? Math.round((last.mtimeMs - first.mtimeMs) / 1000) : null,
+    samples: items.slice(0, 30).map((item) => ({
+      name: item.name,
+      ext: item.ext,
+      size: item.size,
+      birthtime: item.birthtime,
+      mtime: item.mtime,
+      err: (item as any).err,
+    })),
+  };
 }
 
 function createWindow() {
@@ -534,15 +614,20 @@ app.whenReady().then(() => {
         });
         return;
       }
-      const segs = recorder?.getSegments() || [];
+      const sessionSegs =
+        typeof (recorder as any)?.getSessionSegments === "function"
+          ? (recorder as any).getSessionSegments()
+          : [];
+      const segs = sessionSegs.length > 0 ? sessionSegs : [];
+      logger.info("Recorder stopped segment scan", {
+        sessionCount: sessionSegs.length,
+        legacyAutoMergeFallbackUsed: false,
+        summary: summarizeSegmentFiles(segs),
+      });
       if (segs.length > 0 && merger) {
         const outDir = path.join(app.getPath("userData"), "output");
         if (!fs.existsSync(outDir)) fs.mkdirSync(outDir, { recursive: true });
         const outPath = path.join(outDir, formatNowForFilename());
-        logger.info("Auto-merge triggered on stop", {
-          count: segs.length,
-          outPath,
-        });
         // obtain recorder FPS
         let inputFpsRaw: any = 1;
         try {
@@ -565,6 +650,43 @@ app.whenReady().then(() => {
           const mode = (recorder as any).getMode
             ? (recorder as any).getMode()
             : "video";
+          if (mode === "video") {
+            const stats = getFilesStats(segs);
+            logger.info("Auto-merge video segment diagnostics", {
+              mode,
+              inputFps: resolvedInputFps,
+              outputFps,
+              stats,
+              summary: summarizeSegmentFiles(segs),
+            });
+            const tooLarge =
+              stats.totalBytes > AUTO_MERGE_MAX_VIDEO_BYTES ||
+              stats.existing > AUTO_MERGE_MAX_VIDEO_SEGMENTS;
+            if (tooLarge) {
+              const message =
+                "Auto-merge skipped: too many or too large video segments. Use manual merge when the workstation is idle.";
+              logger.warn(message, {
+                count: segs.length,
+                existing: stats.existing,
+                totalBytes: stats.totalBytes,
+                maxBytes: AUTO_MERGE_MAX_VIDEO_BYTES,
+                maxSegments: AUTO_MERGE_MAX_VIDEO_SEGMENTS,
+                missing: stats.missing.length,
+                outPath,
+              });
+              if (rendererReady && mainWindow) {
+                mainWindow.webContents.send("zrada:merge-error", message);
+              }
+              return;
+            }
+          }
+
+          logger.info("Auto-merge triggered on stop", {
+            count: segs.length,
+            outPath,
+            mode,
+          });
+
           if (mode === "image") {
             // assume images are in segments/images/img_%06d.jpg
             const imagesPattern = path.join(
@@ -640,7 +762,7 @@ app.whenReady().then(() => {
             merger
               .mergeSegments(segs, outPath, {
                 inputFps: resolvedInputFps,
-                outputFps: 30,
+                outputFps,
               })
               .then(() => {
                 logger.info("Auto-merge finished", { outPath });
