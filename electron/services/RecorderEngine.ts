@@ -7,6 +7,7 @@ import {
 } from "child_process";
 import fs from "fs";
 import path from "path";
+import os from "os";
 import { app, dialog } from "electron";
 import { getFFmpegPath } from "../utils/ffmpegUtils";
 
@@ -410,6 +411,57 @@ export class RecorderEngine extends EventEmitter {
     }
   }
 
+  private collectMemoryDiagnostics() {
+    const basic = {
+      osTotalMemBytes: os.totalmem(),
+      osFreeMemBytes: os.freemem(),
+      processMemory: process.memoryUsage(),
+      processPid: process.pid,
+    };
+
+    if (process.platform !== "win32") return { basic };
+
+    try {
+      const ps = [
+        "$ErrorActionPreference = 'SilentlyContinue'",
+        "$c = Get-Counter '\\Memory\\Committed Bytes','\\Memory\\Commit Limit','\\Memory\\Available MBytes','\\Paging File(_Total)\\% Usage'",
+        "$map = @{}",
+        "foreach ($s in $c.CounterSamples) { $map[$s.Path] = [double]$s.CookedValue }",
+        "$commitUsed = ($map.Keys | Where-Object { $_ -like '*\\memory\\committed bytes' } | Select-Object -First 1)",
+        "$commitLimit = ($map.Keys | Where-Object { $_ -like '*\\memory\\commit limit' } | Select-Object -First 1)",
+        "$avail = ($map.Keys | Where-Object { $_ -like '*\\memory\\available mbytes' } | Select-Object -First 1)",
+        "$page = ($map.Keys | Where-Object { $_ -like '*\\paging file(_total)\\% usage' } | Select-Object -First 1)",
+        "$committedBytes = $(if ($commitUsed) { $map[$commitUsed] } else { $null })",
+        "$commitLimitBytes = $(if ($commitLimit) { $map[$commitLimit] } else { $null })",
+        "$commitUsagePercent = $(if ($committedBytes -and $commitLimitBytes) { [math]::Round(($committedBytes / $commitLimitBytes) * 100, 2) } else { $null })",
+        "$top = Get-Process | Sort-Object PM -Descending | Select-Object -First 10 @{n='name';e={$_.ProcessName}},Id,@{n='privateBytes';e={$_.PM}},@{n='workingSetBytes';e={$_.WS}},@{n='pagedMemoryBytes';e={$_.PagedMemorySize64}},@{n='virtualMemoryBytes';e={$_.VirtualMemorySize64}}",
+        "$named = Get-Process | Where-Object { $_.ProcessName -match '^(ffmpeg|electron|ZradaLog|firefox|chrome|msedge|X2)$' } | Sort-Object PM -Descending | Select-Object @{n='name';e={$_.ProcessName}},Id,@{n='privateBytes';e={$_.PM}},@{n='workingSetBytes';e={$_.WS}},@{n='pagedMemoryBytes';e={$_.PagedMemorySize64}},@{n='virtualMemoryBytes';e={$_.VirtualMemorySize64}}",
+        "[pscustomobject]@{ counters = [pscustomobject]@{ committedBytes = $committedBytes; commitLimitBytes = $commitLimitBytes; commitUsagePercent = $commitUsagePercent; availableMBytes = $(if ($avail) { $map[$avail] } else { $null }); pagingFileUsagePercent = $(if ($page) { $map[$page] } else { $null }) }; topPrivateBytes = $top; namedProcesses = $named } | ConvertTo-Json -Compress -Depth 5",
+      ].join("; ");
+
+      const result = spawnSync(
+        "powershell.exe",
+        ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps],
+        { encoding: "utf8", windowsHide: true, timeout: 8000 },
+      );
+
+      if (result.status !== 0 || !result.stdout?.trim()) {
+        return {
+          basic,
+          windows: null,
+          err: result.stderr || result.stdout || `status=${result.status}`,
+        };
+      }
+
+      return {
+        basic,
+        windows: JSON.parse(result.stdout),
+      };
+    } catch (e: any) {
+      return { basic, windows: null, err: e?.message };
+    }
+  }
+
   private getCompletedSegmentDurationSec(nextIndex: number) {
     let total = 0;
     try {
@@ -724,6 +776,10 @@ export class RecorderEngine extends EventEmitter {
       return;
     }
 
+    this.logger.info("Memory diagnostics before recorder start", {
+      memory: this.collectMemoryDiagnostics(),
+    });
+
     const isResuming = this.state === "paused";
     if (!isResuming) {
       this.sessionSegments = [];
@@ -964,6 +1020,10 @@ export class RecorderEngine extends EventEmitter {
     });
     this.ffmpegSpawnedAtMs = Date.now();
     this.lowerProcessPriority(this.ff.pid);
+    this.logger.info("Memory diagnostics after ffmpeg spawn", {
+      ffmpegPid: this.ff.pid,
+      memory: this.collectMemoryDiagnostics(),
+    });
 
     this.state = "recording";
     this.logger.info("Recording started", {
@@ -1123,6 +1183,7 @@ export class RecorderEngine extends EventEmitter {
         this.logger.warn("ffmpeg exited with error", {
           code,
           stderrTail: this.lastFfmpegErrorTail,
+          memory: this.collectMemoryDiagnostics(),
         });
       } else {
         this.logger.info("ffmpeg exited", {
