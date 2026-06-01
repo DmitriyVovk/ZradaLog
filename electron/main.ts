@@ -775,8 +775,24 @@ app.whenReady().then(() => {
                       fs.unlinkSync(s);
                     } catch (_) {}
                   }
+                  const sessionLog =
+                    typeof (recorder as any)?.getLastSessionLogPath ===
+                    "function"
+                      ? (recorder as any).getLastSessionLogPath()
+                      : null;
+                  if (sessionLog && fs.existsSync(sessionLog)) {
+                    try {
+                      fs.unlinkSync(sessionLog);
+                    } catch (e: any) {
+                      logger.warn("Session ffmpeg log cleanup failed", {
+                        file: sessionLog,
+                        err: e?.message,
+                      });
+                    }
+                  }
                   logger.info("Segments cleaned after merge", {
                     cleaned: segs.length,
+                    sessionLog,
                   });
                   if (rendererReady && mainWindow)
                     mainWindow.webContents.send("zrada:segments-cleaned");

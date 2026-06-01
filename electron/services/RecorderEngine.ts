@@ -79,6 +79,7 @@ export class RecorderEngine extends EventEmitter {
   private lastFfmpegErrorTail = "";
 
   private sessionLogPath: string | null = null;
+  private lastSessionLogPath: string | null = null;
   private sessionLogStream: fs.WriteStream | null = null;
   private sessionLogMaxFiles = 10;
   private ffmpegSpawnedAtMs = 0;
@@ -198,6 +199,10 @@ export class RecorderEngine extends EventEmitter {
     return this.sessionSegments.slice().sort();
   }
 
+  public getLastSessionLogPath() {
+    return this.lastSessionLogPath;
+  }
+
   public getLastFfmpegExitCode() {
     return this.lastFfmpegExitCode;
   }
@@ -212,7 +217,7 @@ export class RecorderEngine extends EventEmitter {
     skipDedup = false,
     outputFps = 30,
     previousCompressedSec = 0,
-    previousWallSec = 0,
+    previousActiveSec = 0,
     sessionStartStr = "",
   ) {
     const args: string[] = [
@@ -259,12 +264,14 @@ export class RecorderEngine extends EventEmitter {
         const hi = Number(this.mpdecimateSettings.hi) || 20000;
         const lo = Number(this.mpdecimateSettings.lo) || 1500;
         const frac = Number(this.mpdecimateSettings.frac) || 0.3;
-        // Overlay is drawn before setpts so Total uses the original capture
-        // timeline. Compressed is derived from accepted frame count.
+        // Overlay is drawn after mpdecimate and before setpts. Both Total and
+        // Compressed are derived from accepted frame count to avoid jumps from
+        // long unchanged periods in the source timestamp.
+        const inputFps = this.fps > 0 ? this.fps : 1;
         const prevCompSec = Math.max(0, previousCompressedSec);
-        const prevWall = Math.max(0, previousWallSec);
+        const prevActiveSec = Math.max(0, previousActiveSec);
 
-        const totalSecV = `t+${prevWall}`;
+        const totalSecV = `(n/${inputFps})+${prevActiveSec}`;
         const compressedSecV = `(n/${outputFps})+${prevCompSec}`;
         const totalH = `%{eif\\:(${totalSecV})/3600\\:d}`;
         const totalM = `%{eif\\:mod((${totalSecV})/60,60)\\:d\\:2}`;
@@ -314,7 +321,8 @@ export class RecorderEngine extends EventEmitter {
         this.logger.info("Applied overlay filter", {
           mpdecimate: { hi, lo, frac },
           prevCompSec,
-          prevWallSec: prevWall,
+          prevActiveSec,
+          inputFps,
           sessionStartStr,
           outputFps,
         });
@@ -496,16 +504,9 @@ export class RecorderEngine extends EventEmitter {
     return total;
   }
 
-  private getSegmentWallDurationTotalSec(files: string[]) {
-    let total = 0;
-    for (const file of files) {
-      try {
-        const st = fs.statSync(file);
-        const seconds = (st.mtime.getTime() - st.birthtime.getTime()) / 1000;
-        if (Number.isFinite(seconds) && seconds > 0) total += seconds;
-      } catch (_) {}
-    }
-    return total;
+  private compressedToActiveSec(compressedSec: number) {
+    const inputFps = this.fps > 0 ? this.fps : 1;
+    return Math.max(0, compressedSec) * (this.outputFps / inputFps);
   }
 
   private getFirstCompletedSegmentStart(nextIndex: number) {
@@ -680,6 +681,7 @@ export class RecorderEngine extends EventEmitter {
         this.segmentsDir,
         `ffmpeg-session-${ts}-${pid}.log`,
       );
+      this.lastSessionLogPath = this.sessionLogPath;
       this.sessionLogStream = fs.createWriteStream(this.sessionLogPath, {
         flags: "a",
         encoding: "utf8",
@@ -969,8 +971,8 @@ export class RecorderEngine extends EventEmitter {
       const previousCompressedSec = isResuming
         ? this.getSegmentDurationTotalSec(this.sessionSegments)
         : 0;
-      const previousWallSec = isResuming
-        ? this.getSegmentWallDurationTotalSec(this.sessionSegments)
+      const previousActiveSec = isResuming
+        ? this.compressedToActiveSec(previousCompressedSec)
         : 0;
       // Session start time embedded into the Clock overlay ("YYYY-MM-DD HH:MM").
       // The colon in HH:MM is pre-escaped as \: so drawtext renders it as ':'
@@ -987,14 +989,14 @@ export class RecorderEngine extends EventEmitter {
         false,
         this.outputFps,
         previousCompressedSec,
-        previousWallSec,
+        previousActiveSec,
         sessionStartStr,
       );
       this.logger.info("Spawning ffmpeg (video)", {
         args,
         startIndex: nextIndex,
         previousCompressedSec,
-        previousWallSec,
+        previousActiveSec,
         sessionSegmentCount: this.sessionSegments.length,
         segmentIntervalSec: this.segmentIntervalSec,
         captureFps: this.fps,
