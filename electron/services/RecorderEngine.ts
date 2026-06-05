@@ -17,6 +17,7 @@ const BATCH_SIZE = 10;
 const MAX_PENDING = 100;
 const RETRY_POLICY_MS = [100, 300, 900];
 const FFMPEG_PROGRESS_DIAG_INTERVAL_MS = 30000;
+const FFMPEG_SESSION_PROGRESS_LOG_INTERVAL_MS = 10000;
 
 export type RecorderState =
   | "idle"
@@ -86,6 +87,7 @@ export class RecorderEngine extends EventEmitter {
   private lastSegmentSeenAtMs: number | null = null;
   private lastSegmentIndex: number | null = null;
   private progressDiagLastAtMs = 0;
+  private sessionProgressLogLastAtMs = 0;
   private currentSessionStartIndex = 0;
   private currentPreviousCompressedSec = 0;
   private currentSessionStartStr = "";
@@ -720,6 +722,27 @@ export class RecorderEngine extends EventEmitter {
     }
   }
 
+  private shouldWriteSessionStderrChunk(chunk: string, now: number) {
+    const lines = chunk
+      .replace(/\r/g, "\n")
+      .split("\n")
+      .map((line) => line.trim())
+      .filter(Boolean);
+    if (lines.length === 0) return false;
+
+    const isProgressOnly = lines.every((line) => /^frame=\s*\d+/.test(line));
+    if (!isProgressOnly) return true;
+
+    if (
+      now - this.sessionProgressLogLastAtMs >=
+      FFMPEG_SESSION_PROGRESS_LOG_INTERVAL_MS
+    ) {
+      this.sessionProgressLogLastAtMs = now;
+      return true;
+    }
+    return false;
+  }
+
   private async flushFfmpegLog(reason = "flush") {
     try {
       if (!this.ffmpegDebug) {
@@ -826,6 +849,7 @@ export class RecorderEngine extends EventEmitter {
     this.lastSegmentSeenAtMs = null;
     this.lastSegmentIndex = null;
     this.progressDiagLastAtMs = 0;
+    this.sessionProgressLogLastAtMs = 0;
 
     let args: string[];
     if (this.mode === "image") {
@@ -1054,7 +1078,10 @@ export class RecorderEngine extends EventEmitter {
 
     this.ff.stderr.on("data", (chunk) => {
       const s = chunk.toString();
-      this.writeSessionLog(s);
+      const now = Date.now();
+      if (this.shouldWriteSessionStderrChunk(s, now)) {
+        this.writeSessionLog(s);
+      }
       // Keep a rolling tail of stderr for error diagnostics on non-zero exit.
       const lines = s.split(/\r?\n/).filter((l: string) => l.trim());
       this.ffmpegLastStderr.push(...lines);
@@ -1071,7 +1098,6 @@ export class RecorderEngine extends EventEmitter {
       const imageRe =
         /Opening '(.+img_\d+\.(?:jpg|jpeg|png))(?:' for writing)?/g;
       const progress = this.parseFfmpegProgress(s);
-      const now = Date.now();
       if (
         progress.frame !== null &&
         now - this.progressDiagLastAtMs >= FFMPEG_PROGRESS_DIAG_INTERVAL_MS
