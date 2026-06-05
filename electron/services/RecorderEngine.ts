@@ -90,6 +90,8 @@ export class RecorderEngine extends EventEmitter {
   private sessionProgressLogLastAtMs = 0;
   private currentSessionStartIndex = 0;
   private currentPreviousCompressedSec = 0;
+  private currentPreviousActiveSec = 0;
+  private sessionRecordedActiveSec = 0;
   private currentSessionStartStr = "";
 
   constructor(logger: LoggerService) {
@@ -266,14 +268,13 @@ export class RecorderEngine extends EventEmitter {
         const hi = Number(this.mpdecimateSettings.hi) || 20000;
         const lo = Number(this.mpdecimateSettings.lo) || 1500;
         const frac = Number(this.mpdecimateSettings.frac) || 0.3;
-        // Overlay is drawn after mpdecimate and before setpts. Both Total and
-        // Compressed are derived from accepted frame count to avoid jumps from
-        // long unchanged periods in the source timestamp.
-        const inputFps = this.fps > 0 ? this.fps : 1;
+        // Overlay is drawn after mpdecimate and before setpts. Total uses the
+        // accepted frame's original capture timestamp (`t`), so it follows real
+        // recording time instead of output fps or accepted-frame count.
         const prevCompSec = Math.max(0, previousCompressedSec);
         const prevActiveSec = Math.max(0, previousActiveSec);
 
-        const totalSecV = `(n/${inputFps})+${prevActiveSec}`;
+        const totalSecV = `t+${prevActiveSec}`;
         const compressedSecV = `(n/${outputFps})+${prevCompSec}`;
         const totalH = `%{eif\\:(${totalSecV})/3600\\:d}`;
         const totalM = `%{eif\\:mod((${totalSecV})/60,60)\\:d\\:2}`;
@@ -324,9 +325,10 @@ export class RecorderEngine extends EventEmitter {
           mpdecimate: { hi, lo, frac },
           prevCompSec,
           prevActiveSec,
-          inputFps,
           sessionStartStr,
           outputFps,
+          totalFormula: "t+previousActiveSec",
+          compressedFormula: "n/outputFps+previousCompressedSec",
         });
       }
       // No dedup fallback for video mode - mpdecimate only
@@ -504,11 +506,6 @@ export class RecorderEngine extends EventEmitter {
       if (Number.isFinite(seconds) && seconds > 0) total += seconds;
     }
     return total;
-  }
-
-  private compressedToActiveSec(compressedSec: number) {
-    const inputFps = this.fps > 0 ? this.fps : 1;
-    return Math.max(0, compressedSec) * (this.outputFps / inputFps);
   }
 
   private getFirstCompletedSegmentStart(nextIndex: number) {
@@ -808,6 +805,7 @@ export class RecorderEngine extends EventEmitter {
     const isResuming = this.state === "paused";
     if (!isResuming) {
       this.sessionSegments = [];
+      this.sessionRecordedActiveSec = 0;
       this.openSessionLog();
     } else {
       this.writeSessionLog(`[SESSION RESUME] ${new Date().toISOString()}\n`);
@@ -845,6 +843,7 @@ export class RecorderEngine extends EventEmitter {
     const nextIndex = this.computeNextIndex(filesForIndex);
     this.currentSessionStartIndex = nextIndex;
     this.currentPreviousCompressedSec = 0;
+    this.currentPreviousActiveSec = 0;
     this.currentSessionStartStr = "";
     this.lastSegmentSeenAtMs = null;
     this.lastSegmentIndex = null;
@@ -995,9 +994,7 @@ export class RecorderEngine extends EventEmitter {
       const previousCompressedSec = isResuming
         ? this.getSegmentDurationTotalSec(this.sessionSegments)
         : 0;
-      const previousActiveSec = isResuming
-        ? this.compressedToActiveSec(previousCompressedSec)
-        : 0;
+      const previousActiveSec = isResuming ? this.sessionRecordedActiveSec : 0;
       // Session start time embedded into the Clock overlay ("YYYY-MM-DD HH:MM").
       // The colon in HH:MM is pre-escaped as \: so drawtext renders it as ':'
       // without misinterpreting it as a filter-option separator.
@@ -1006,6 +1003,7 @@ export class RecorderEngine extends EventEmitter {
         : new Date();
       const sessionStartStr = this.formatOverlayDateTime(sessionStart);
       this.currentPreviousCompressedSec = previousCompressedSec;
+      this.currentPreviousActiveSec = previousActiveSec;
       this.currentSessionStartStr = sessionStartStr;
       args = this.buildFfmpegArgs(
         outPattern,
@@ -1021,6 +1019,7 @@ export class RecorderEngine extends EventEmitter {
         startIndex: nextIndex,
         previousCompressedSec,
         previousActiveSec,
+        sessionRecordedActiveSec: this.sessionRecordedActiveSec,
         sessionSegmentCount: this.sessionSegments.length,
         segmentIntervalSec: this.segmentIntervalSec,
         captureFps: this.fps,
@@ -1161,6 +1160,8 @@ export class RecorderEngine extends EventEmitter {
           outputFps: this.outputFps,
           startIndex: this.currentSessionStartIndex,
           previousCompressedSec: this.currentPreviousCompressedSec,
+          previousActiveSec: this.currentPreviousActiveSec,
+          sessionRecordedActiveSec: this.sessionRecordedActiveSec,
           sessionStartStr: this.currentSessionStartStr,
           fileDiag: this.getFileDiag(abs),
         });
@@ -1203,6 +1204,13 @@ export class RecorderEngine extends EventEmitter {
 
     this.ff.on("close", (code) => {
       const closeAt = Date.now();
+      const processElapsedSec =
+        this.ffmpegSpawnedAtMs > 0
+          ? Math.max(0, (closeAt - this.ffmpegSpawnedAtMs) / 1000)
+          : 0;
+      if (this.mode === "video" && processElapsedSec > 0) {
+        this.sessionRecordedActiveSec += processElapsedSec;
+      }
       this.lastFfmpegExitCode = code;
       if (code !== 0 && code !== null) {
         this.lastFfmpegErrorTail = this.ffmpegLastStderr.slice(-15).join(" | ");
@@ -1217,10 +1225,8 @@ export class RecorderEngine extends EventEmitter {
         this.logger.info("ffmpeg exited", {
           code,
           pid: this.ff?.pid,
-          elapsedSec:
-            this.ffmpegSpawnedAtMs > 0
-              ? Math.round((closeAt - this.ffmpegSpawnedAtMs) / 1000)
-              : null,
+          elapsedSec: Math.round(processElapsedSec),
+          sessionRecordedActiveSec: Math.round(this.sessionRecordedActiveSec),
           segmentsInMemory: this.segments.length,
           sessionSegmentsInMemory: this.sessionSegments.length,
           lastSegmentIndex: this.lastSegmentIndex,
