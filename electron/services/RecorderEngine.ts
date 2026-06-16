@@ -78,6 +78,9 @@ export class RecorderEngine extends EventEmitter {
   private readonly STDERR_TAIL_LINES = 30;
   private lastFfmpegExitCode: number | null = null;
   private lastFfmpegErrorTail = "";
+  private lastSegmentSize: number | null = null;
+  private lastFewSegmentSizes: number[] = [];
+  private gdigrabErrorCount = 0;
 
   private sessionLogPath: string | null = null;
   private lastSessionLogPath: string | null = null;
@@ -228,6 +231,8 @@ export class RecorderEngine extends EventEmitter {
       "-y",
       "-f",
       "gdigrab",
+      "-rtbufsize",
+      "256M",
       "-framerate",
       String(this.fps),
       "-i",
@@ -274,20 +279,28 @@ export class RecorderEngine extends EventEmitter {
         const prevCompSec = Math.max(0, previousCompressedSec);
         const prevActiveSec = Math.max(0, previousActiveSec);
 
-        const totalSecV = `t+${prevActiveSec}`;
-        const compressedSecV = `(n/${outputFps})+${prevCompSec}`;
-        const totalH = `%{eif\\:(${totalSecV})/3600\\:d}`;
-        const totalM = `%{eif\\:mod((${totalSecV})/60,60)\\:d\\:2}`;
-        const compressedSec = `%{eif\\:${compressedSecV}\\:d}`;
+        // Wall-clock elapsed time: use system time, not output PTS
+        // Get current epoch seconds and compute elapsed from session start
+        const nowEpochSec = Math.floor(Date.now() / 1000);
+        const sessionStartEpochSec = nowEpochSec; // Will be computed real-time from %{localtime:%s}
+        // Since we can't easily pass this to drawtext, we compute real-time elapsed as:
+        // realElapsedSec = %{localtime:%s} - sessionStartEpochSec (will be injected)
+        // But simpler: just use elapsed wall-clock from known start
+        // The overlay will show: "Total [real wall-clock elapsed]h [m]m"
+        // instead of output PTS time which gets corrupted by filters
 
-        // Current date-time via separate localtime calls (avoids colon-in-format issues).
+        const realTotalSec = `(%{localtime\\:%s})-${nowEpochSec}`; // Wall-clock seconds elapsed
+        const realTotalH = `%{eif\\:((${realTotalSec}))/3600\\:d}`;
+        const realTotalM = `%{eif\\:mod((${realTotalSec})/60,60)\\:d\\:2}`;
+        const compressedSec = `%{eif\\:${prevCompSec}\\:d}`;
+
         const startLabel = sessionStartStr || "????-??-?? ??\\:??";
         const curDate = `%{localtime\\:%Y-%m-%d}`;
         const curHM = `%{localtime\\:%H}\\:%{localtime\\:%M}`;
 
         const overlayText =
           `Work From ${startLabel} To ${curDate} ${curHM}` +
-          ` | Total ${totalH}h ${totalM}m` +
+          ` | Real Time ${realTotalH}h ${realTotalM}m` +
           ` | Compressed ${compressedSec} sec`;
 
         const dt =
@@ -300,7 +313,7 @@ export class RecorderEngine extends EventEmitter {
           dt,
           `settb=AVTB`,
           `setpts=N/(${outputFps}*TB)`,
-          `fps=${outputFps}`,
+          `fps=${outputFps}:eof_action=pass`,
           `format=yuv420p`,
         ].join(",");
 
@@ -317,7 +330,7 @@ export class RecorderEngine extends EventEmitter {
           "-vf",
           vf,
           "-vsync",
-          "cfr",
+          "vfr",
           "-r",
           String(outputFps),
         );
@@ -327,8 +340,8 @@ export class RecorderEngine extends EventEmitter {
           prevActiveSec,
           sessionStartStr,
           outputFps,
-          totalFormula: "t+previousActiveSec",
-          compressedFormula: "n/outputFps+previousCompressedSec",
+          note: "Uses wall-clock elapsed time (%{localtime:%s}) for real time, not output PTS",
+          note2: "fps filter changed to eof_action=pass and -vsync vfr to prevent frame-flood on gdigrab stalls",
         });
       }
       // No dedup fallback for video mode - mpdecimate only
@@ -806,6 +819,8 @@ export class RecorderEngine extends EventEmitter {
     if (!isResuming) {
       this.sessionSegments = [];
       this.sessionRecordedActiveSec = 0;
+      this.gdigrabErrorCount = 0;
+      this.lastFewSegmentSizes = [];
       this.openSessionLog();
     } else {
       this.writeSessionLog(`[SESSION RESUME] ${new Date().toISOString()}\n`);
@@ -1121,6 +1136,19 @@ export class RecorderEngine extends EventEmitter {
       }
       let mVideo: RegExpExecArray | null;
       let mImage: RegExpExecArray | null;
+
+      // Detect gdigrab errors early
+      if (s.includes("desktop: Cannot allocate memory")) {
+        this.gdigrabErrorCount++;
+        this.logger.error("gdigrab memory allocation failed — potential frame-flood risk", {
+          occurrenceCount: this.gdigrabErrorCount,
+          sessionElapsedSec: this.ffmpegSpawnedAtMs > 0
+            ? Math.round((now - this.ffmpegSpawnedAtMs) / 1000)
+            : null,
+          memory: this.collectMemoryDiagnostics(),
+        });
+      }
+
       while ((mVideo = videoRe.exec(s)) !== null) {
         const file = mVideo[1];
         const abs = path.isAbsolute(file)
@@ -1165,6 +1193,33 @@ export class RecorderEngine extends EventEmitter {
           sessionStartStr: this.currentSessionStartStr,
           fileDiag: this.getFileDiag(abs),
         });
+        // Anomaly detection: check for unusually large or identical segments (frame-flood indicator)
+        const segSize = this.getFileDiag(abs).exists ? (this.getFileDiag(abs) as any).size : null;
+        if (segSize && segSize > 300 * 1024 * 1024) { // > 300MB
+          const deltaFromPrev = previousSeenAt ? Math.round((now - previousSeenAt) / 1000) : null;
+          if (deltaFromPrev && deltaFromPrev < this.segmentIntervalSec * 0.5) { // delta < 2.5min for 5min segments
+            this.logger.warn("Segment size anomaly: large segment created too quickly (possible frame flood)", {
+              segmentIndex,
+              sizeBytes: segSize,
+              deltaFromPreviousSec: deltaFromPrev,
+              expectedDeltaSec: this.segmentIntervalSec,
+              previousSegmentSize: this.lastSegmentSize,
+              recentSizePattern: this.lastFewSegmentSizes.slice(-5),
+            });
+          }
+        }
+        if (segSize && this.lastSegmentSize && segSize === this.lastSegmentSize) {
+          this.logger.warn("Segment size identical to previous: potential duplicate frame content", {
+            segmentIndex,
+            sizeBytes: segSize,
+            identicalToLastN: this.lastFewSegmentSizes.filter(s => s === segSize).length + 1,
+          });
+        }
+        this.lastSegmentSize = segSize || null;
+        if (segSize) {
+          this.lastFewSegmentSizes.push(segSize);
+          if (this.lastFewSegmentSizes.length > 20) this.lastFewSegmentSizes.shift();
+        }
         this.emit("segment", abs);
       }
       while ((mImage = imageRe.exec(s)) !== null) {
