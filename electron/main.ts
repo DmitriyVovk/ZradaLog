@@ -22,8 +22,14 @@ import { LoggerService } from "./services/LoggerService";
 import { RecorderEngine } from "./services/RecorderEngine";
 import { MergerService } from "./services/MergerService";
 import { getFFmpegPath } from "./utils/ffmpegUtils";
+import * as WorkspaceManager from "./services/WorkspaceManager";
 
 let FFMPEG_PATH: string;
+
+// Resolve the workspace root as early as possible. For a known pointer this
+// applies app.setPath("userData", root) right now; for first run it defers the
+// folder-choice dialog until the app is ready (see whenReady below).
+const startupWorkspace = WorkspaceManager.resolveAtStartup();
 
 function ensureFFmpegCopy(): void {
   try {
@@ -95,6 +101,9 @@ let rendererReady = false;
 const pendingLogs: any[] = [];
 let outputFps = 24;
 let savedCount = 0;
+// True while a merge / image-assemble is running. Blocks workspace relocation
+// so we never move files mid-merge.
+let mergeInProgress = false;
 const AUTO_MERGE_MAX_VIDEO_BYTES = 1536 * 1024 * 1024;
 const AUTO_MERGE_MAX_VIDEO_SEGMENTS = 16;
 // Flag: was recording auto-paused by sleep event (vs manual pause by user)
@@ -103,8 +112,11 @@ let sleepPausedRec = false;
 let screenIsLocked = false;
 // Timer handle for delayed auto-resume after wake
 let wakeResumeTimer: NodeJS.Timeout | null = null;
-// persisted settings path
-const settingsPath = path.join(app.getPath("userData") || ".", "settings.json");
+// persisted settings path — resolved on each access so it always follows the
+// current workspace root (app.setPath("userData", …) may have overridden it).
+function getSettingsPath(): string {
+  return path.join(app.getPath("userData") || ".", "settings.json");
+}
 let settingsCache: any = null;
 let dedupSettings: { algorithm: string; threshold: number; enabled?: boolean } =
   { algorithm: "phash", threshold: 12, enabled: false };
@@ -117,6 +129,7 @@ let mpdecimateSettings: {
 
 function loadSettings() {
   try {
+    const settingsPath = getSettingsPath();
     if (fs.existsSync(settingsPath)) {
       const raw = fs.readFileSync(settingsPath, "utf8");
       settingsCache = JSON.parse(raw || "{}");
@@ -147,6 +160,7 @@ function saveSettings() {
           ? (recorder as any).getFps()
           : settingsCache.fps;
     } catch (_) {}
+    const settingsPath = getSettingsPath();
     fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
     fs.writeFileSync(
       settingsPath,
@@ -364,7 +378,44 @@ function createWindow() {
   });
 }
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
+  // Deferred relocation: perform the move requested in the previous session
+  // NOW, before any file handle is opened on the workspace (logger, recorder,
+  // session logs). Doing it here avoids the Windows EPERM locks that a live
+  // move hits. On failure we stay on the old root and inform the user.
+  if (startupWorkspace.pendingMove) {
+    const { from, to } = startupWorkspace.pendingMove;
+    try {
+      const res = await WorkspaceManager.performPendingMove(from, to);
+      if (!res.ok) {
+        dialog.showMessageBoxSync({
+          type: "error",
+          title: "ZradaLog — перенос рабочей директории",
+          message: "Не удалось перенести рабочую директорию.",
+          detail: `${res.err || "Неизвестная ошибка"}\n\nПриложение продолжит работу в прежней папке:\n${from}`,
+        });
+      }
+    } catch (e: any) {
+      try {
+        WorkspaceManager.writePointer(from);
+        app.setPath("userData", from);
+      } catch (_) {}
+      dialog.showMessageBoxSync({
+        type: "error",
+        title: "ZradaLog — перенос рабочей директории",
+        message: "Не удалось перенести рабочую директорию.",
+        detail: `${e?.message || e}\n\nПриложение продолжит работу в прежней папке:\n${from}`,
+      });
+    }
+  } else if (startupWorkspace.isFirstRun) {
+    // First run: ask the user where to place the workspace BEFORE anything reads
+    // userData (logger, recorder, settings). promptFirstRun() applies the chosen
+    // root via app.setPath("userData", …) and writes the pointer file.
+    try {
+      WorkspaceManager.promptFirstRun();
+    } catch (_) {}
+  }
+
   const userData = app.getPath("userData");
   const logDir = path.join(userData, "logs");
   logger = new LoggerService(logDir);
@@ -708,11 +759,13 @@ app.whenReady().then(() => {
               outPath,
             ];
             logger.info("Assembling images to video", { args });
+            mergeInProgress = true;
             const ff = spawn(FFMPEG_PATH, args, { windowsHide: true });
             ff.stderr.on("data", (c) =>
               logger.debug("ffmpeg", { stderr: c.toString() }),
             );
             ff.on("close", (code) => {
+              mergeInProgress = false;
               if (code === 0) {
                 logger.info("Image-assemble finished", { outPath });
                 if (rendererReady && mainWindow)
@@ -759,12 +812,14 @@ app.whenReady().then(() => {
             });
           } else {
             // default: use MergerService for video segments
+            mergeInProgress = true;
             merger
               .mergeSegments(segs, outPath, {
                 inputFps: resolvedInputFps,
                 outputFps,
               })
               .then(() => {
+                mergeInProgress = false;
                 logger.info("Auto-merge finished", { outPath });
                 if (rendererReady && mainWindow)
                   mainWindow.webContents.send("zrada:merge-done", outPath);
@@ -801,6 +856,7 @@ app.whenReady().then(() => {
                 }
               })
               .catch((err) => {
+                mergeInProgress = false;
                 logger.error("Auto-merge failed", { err: err.message });
                 if (rendererReady && mainWindow)
                   mainWindow.webContents.send("zrada:merge-error", err.message);
@@ -1049,6 +1105,78 @@ app.whenReady().then(() => {
     }
   });
 
+  // ─── Workspace (working directory) ─────────────────────────────────────────
+  ipcMain.handle("zrada:get-workspace", () => {
+    try {
+      const s = WorkspaceManager.currentState();
+      return { ok: true, ...s };
+    } catch (e: any) {
+      return { ok: false, err: e?.message };
+    }
+  });
+
+  ipcMain.handle("zrada:open-workspace", async () => {
+    try {
+      const root = app.getPath("userData");
+      if (!fs.existsSync(root)) fs.mkdirSync(root, { recursive: true });
+      await shell.openPath(root);
+      return { ok: true, root };
+    } catch (e: any) {
+      logger.error("Open workspace folder failed", { err: e?.message });
+      return { ok: false, err: e?.message };
+    }
+  });
+
+  ipcMain.handle("zrada:change-workspace", async () => {
+    try {
+      // Recording must be stopped — moving files while ffmpeg writes them would
+      // corrupt the migration.
+      const state = recorder?.getState?.();
+      if (state && state !== "idle" && state !== "stopped") {
+        return {
+          ok: false,
+          err: "Остановите запись перед переносом рабочей директории.",
+        };
+      }
+      // A merge (incl. the auto-merge that runs after Stop) holds files open
+      // and must finish first.
+      if (mergeInProgress) {
+        return {
+          ok: false,
+          err: "Дождитесь завершения объединения видео (merge), затем повторите.",
+        };
+      }
+
+      const oldRoot = app.getPath("userData");
+      const picked = dialog.showOpenDialogSync(mainWindow!, {
+        title: "Новая рабочая директория ZradaLog",
+        properties: ["openDirectory", "createDirectory"],
+      });
+      if (!picked || !picked[0]) return { ok: false, cancelled: true };
+      const newRoot = picked[0];
+
+      const validationErr = WorkspaceManager.validateNewRoot(oldRoot, newRoot);
+      if (validationErr) return { ok: false, err: validationErr };
+
+      logger.info("Workspace change requested — relaunching to apply", {
+        oldRoot,
+        newRoot,
+      });
+
+      // Defer the actual move to the next startup (performed before any file
+      // handle is opened) to avoid Windows EPERM locks on logs/segments.
+      WorkspaceManager.requestMove(oldRoot, newRoot);
+      app.relaunch();
+      app.exit(0);
+      return { ok: true, root: newRoot, relaunching: true };
+    } catch (e: any) {
+      try {
+        logger.error("Change workspace failed", { err: e?.message });
+      } catch (_) {}
+      return { ok: false, err: e?.message };
+    }
+  });
+
   ipcMain.handle("zrada:delete-all", async () => {
     try {
       const userData = app.getPath("userData");
@@ -1140,10 +1268,15 @@ app.whenReady().then(() => {
         outputFps,
       });
 
-      await merger.mergeSegments(files, outPath, {
-        inputFps: 1,
-        outputFps: outputFps,
-      });
+      mergeInProgress = true;
+      try {
+        await merger.mergeSegments(files, outPath, {
+          inputFps: 1,
+          outputFps: outputFps,
+        });
+      } finally {
+        mergeInProgress = false;
+      }
 
       logger.info("Manual merge completed successfully", { outPath });
       return { ok: true, outPath };

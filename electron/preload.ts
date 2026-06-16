@@ -85,6 +85,13 @@ contextBridge.exposeInMainWorld('zradaFS', {
   openOutputFolder: () => ipcRenderer.invoke('zrada:open-output')
 });
 
+// Workspace (working directory) management
+contextBridge.exposeInMainWorld('zradaWorkspace', {
+  get: () => ipcRenderer.invoke('zrada:get-workspace'),
+  open: () => ipcRenderer.invoke('zrada:open-workspace'),
+  change: () => ipcRenderer.invoke('zrada:change-workspace')
+});
+
 contextBridge.exposeInMainWorld('zradaAdmin', {
   deleteAllFiles: () => ipcRenderer.invoke('zrada:delete-all'),
   mergeAll: () => ipcRenderer.invoke('zrada:merge-all'),
