@@ -8,7 +8,7 @@ import {
 import fs from "fs";
 import path from "path";
 import os from "os";
-import { app, dialog } from "electron";
+import { app, dialog, powerMonitor, screen } from "electron";
 import { getFFmpegPath } from "../utils/ffmpegUtils";
 
 const FFMPEG_PATH = getFFmpegPath();
@@ -18,6 +18,8 @@ const MAX_PENDING = 100;
 const RETRY_POLICY_MS = [100, 300, 900];
 const FFMPEG_PROGRESS_DIAG_INTERVAL_MS = 30000;
 const FFMPEG_SESSION_PROGRESS_LOG_INTERVAL_MS = 10000;
+const ACTIVITY_TICK_MS = 1000;
+const ACTIVITY_LOG_INTERVAL_MS = 60000;
 
 export type RecorderState =
   | "idle"
@@ -91,6 +93,15 @@ export class RecorderEngine extends EventEmitter {
   private lastSegmentIndex: number | null = null;
   private progressDiagLastAtMs = 0;
   private sessionProgressLogLastAtMs = 0;
+  private lastFfmpegProgressFrame: number | null = null;
+  private activityTimer?: NodeJS.Timeout;
+  private activityLastTickMs = 0;
+  private activityLastProgressFrame: number | null = null;
+  private activityLastCursor: { x: number; y: number } | null = null;
+  private activityLastLogAtMs = 0;
+  private activityStats = this.createEmptyActivityStats();
+  private watermarkTextPath: string | null = null;
+  private watermarkLastText = "";
   private currentSessionStartIndex = 0;
   private currentPreviousCompressedSec = 0;
   private currentPreviousActiveSec = 0;
@@ -218,6 +229,175 @@ export class RecorderEngine extends EventEmitter {
     return this.lastFfmpegErrorTail;
   }
 
+  private createEmptyActivityStats() {
+    return {
+      ticks: 0,
+      activeTicks: 0,
+      frameTicks: 0,
+      inputTicks: 0,
+      cursorTicks: 0,
+      idleTicks: 0,
+      addedSec: 0,
+    };
+  }
+
+  private escapeDrawtextFilePath(file: string) {
+    return file.replace(/\\/g, "/").replace(/:/g, "\\:");
+  }
+
+  private formatOverlayDuration(totalSec: number) {
+    const sec = Math.max(0, Math.floor(totalSec));
+    const hours = Math.floor(sec / 3600);
+    const minutes = Math.floor((sec % 3600) / 60);
+    return `${hours}h ${String(minutes).padStart(2, "0")}m`;
+  }
+
+  private buildWatermarkText() {
+    const compressedSec =
+      this.currentPreviousCompressedSec +
+      Math.max(0, this.lastFfmpegProgressFrame ?? 0) /
+        Math.max(1, this.outputFps || 1);
+    return (
+      `Work From ${this.currentSessionStartStr.replace(/\\:/g, ":")} ` +
+      `To ${this.formatOverlayDateTime(new Date()).replace(/\\:/g, ":")}` +
+      ` | Total ${this.formatOverlayDuration(this.sessionRecordedActiveSec)}` +
+      ` | Compressed ${Math.floor(compressedSec)} sec`
+    );
+  }
+
+  private prepareWatermarkTextFile() {
+    const file = path.join(
+      this.segmentsDir,
+      `watermark-${Date.now()}-${process.pid}.txt`,
+    );
+    this.watermarkTextPath = file;
+    this.watermarkLastText = "";
+    this.writeWatermarkText("prepare");
+    return file;
+  }
+
+  private writeWatermarkText(reason: string) {
+    if (!this.watermarkTextPath) return;
+    try {
+      const text = this.buildWatermarkText();
+      if (text === this.watermarkLastText) return;
+      fs.writeFileSync(this.watermarkTextPath, text, "utf8");
+      this.watermarkLastText = text;
+      this.logger.debug("Watermark text updated", { reason, text });
+    } catch (e: any) {
+      this.logger.warn("Failed to update watermark text", {
+        reason,
+        err: e?.message,
+      });
+    }
+  }
+
+  private cleanupWatermarkTextFile() {
+    const file = this.watermarkTextPath;
+    this.watermarkTextPath = null;
+    this.watermarkLastText = "";
+    if (!file) return;
+    try {
+      if (fs.existsSync(file)) fs.unlinkSync(file);
+    } catch (e: any) {
+      this.logger.debug("Failed to remove watermark text file", {
+        file,
+        err: e?.message,
+      });
+    }
+  }
+
+  private startActivityTracker() {
+    this.stopActivityTracker("restart");
+    this.activityLastTickMs = Date.now();
+    this.activityLastProgressFrame = this.lastFfmpegProgressFrame;
+    this.activityLastLogAtMs = this.activityLastTickMs;
+    this.activityStats = this.createEmptyActivityStats();
+    try {
+      const p = screen.getCursorScreenPoint();
+      this.activityLastCursor = { x: p.x, y: p.y };
+    } catch (_) {
+      this.activityLastCursor = null;
+    }
+
+    this.activityTimer = setInterval(() => {
+      this.collectActivityTick("timer");
+    }, ACTIVITY_TICK_MS);
+    this.logger.info("Activity tracker started", {
+      tickMs: ACTIVITY_TICK_MS,
+      indicators: ["accepted-frame-progress", "system-input-idle", "cursor-position"],
+    });
+  }
+
+  private stopActivityTracker(reason: string) {
+    if (this.activityTimer) {
+      clearInterval(this.activityTimer);
+      this.activityTimer = undefined;
+    }
+    this.collectActivityTick(reason);
+    this.writeWatermarkText(reason);
+  }
+
+  private collectActivityTick(reason: string) {
+    if (this.mode !== "video") return;
+    const now = Date.now();
+    if (!this.activityLastTickMs) {
+      this.activityLastTickMs = now;
+      return;
+    }
+
+    const elapsedSec = Math.max(0, (now - this.activityLastTickMs) / 1000);
+    this.activityLastTickMs = now;
+    if (elapsedSec <= 0) return;
+
+    const countedSec = Math.min(elapsedSec, ACTIVITY_TICK_MS / 1000);
+    const currentFrame = this.lastFfmpegProgressFrame;
+    const previousFrame = this.activityLastProgressFrame;
+    const frameAccepted =
+      currentFrame !== null &&
+      (previousFrame === null || currentFrame > previousFrame);
+    this.activityLastProgressFrame = currentFrame;
+
+    let inputRecent = false;
+    try {
+      inputRecent = powerMonitor.getSystemIdleTime() <= Math.ceil(elapsedSec) + 1;
+    } catch (_) {}
+
+    let cursorMoved = false;
+    try {
+      const p = screen.getCursorScreenPoint();
+      cursorMoved =
+        this.activityLastCursor !== null &&
+        (p.x !== this.activityLastCursor.x || p.y !== this.activityLastCursor.y);
+      this.activityLastCursor = { x: p.x, y: p.y };
+    } catch (_) {}
+
+    const active = frameAccepted || inputRecent || cursorMoved;
+    this.activityStats.ticks++;
+    if (frameAccepted) this.activityStats.frameTicks++;
+    if (inputRecent) this.activityStats.inputTicks++;
+    if (cursorMoved) this.activityStats.cursorTicks++;
+    if (active) {
+      this.activityStats.activeTicks++;
+      this.activityStats.addedSec += countedSec;
+      this.sessionRecordedActiveSec += countedSec;
+      this.writeWatermarkText(reason);
+    } else {
+      this.activityStats.idleTicks++;
+    }
+
+    if (now - this.activityLastLogAtMs >= ACTIVITY_LOG_INTERVAL_MS) {
+      this.activityLastLogAtMs = now;
+      this.logger.info("Activity tracker summary", {
+        stats: this.activityStats,
+        sessionRecordedActiveSec:
+          Math.round(this.sessionRecordedActiveSec * 1000) / 1000,
+        lastProgressFrame: this.lastFfmpegProgressFrame,
+      });
+      this.activityStats = this.createEmptyActivityStats();
+    }
+  }
+
   private buildFfmpegArgs(
     outPattern: string,
     startNumber = 0,
@@ -226,6 +406,7 @@ export class RecorderEngine extends EventEmitter {
     previousCompressedSec = 0,
     previousActiveSec = 0,
     sessionStartStr = "",
+    watermarkTextFile = "",
   ) {
     const args: string[] = [
       "-y",
@@ -273,45 +454,25 @@ export class RecorderEngine extends EventEmitter {
         const hi = Number(this.mpdecimateSettings.hi) || 20000;
         const lo = Number(this.mpdecimateSettings.lo) || 1500;
         const frac = Number(this.mpdecimateSettings.frac) || 0.3;
-        // Overlay is drawn after mpdecimate and before setpts. Total uses the
-        // accepted frame's original capture timestamp (`t`), so it follows real
-        // recording time instead of output fps or accepted-frame count.
+        // Draw after mpdecimate, so `n` is the accepted-frame counter. Total is
+        // counted from accepted frames, not wall-clock gaps between them.
         const prevCompSec = Math.max(0, previousCompressedSec);
         const prevActiveSec = Math.max(0, previousActiveSec);
-
-        // Wall-clock elapsed time: use system time, not output PTS
-        // Get current epoch seconds and compute elapsed from session start
-        const nowEpochSec = Math.floor(Date.now() / 1000);
-        const sessionStartEpochSec = nowEpochSec; // Will be computed real-time from %{localtime:%s}
-        // Since we can't easily pass this to drawtext, we compute real-time elapsed as:
-        // realElapsedSec = %{localtime:%s} - sessionStartEpochSec (will be injected)
-        // But simpler: just use elapsed wall-clock from known start
-        // The overlay will show: "Total [real wall-clock elapsed]h [m]m"
-        // instead of output PTS time which gets corrupted by filters
-
-        const realTotalSec = `(%{localtime\\:%s})-${nowEpochSec}`; // Wall-clock seconds elapsed
-        const realTotalH = `%{eif\\:((${realTotalSec}))/3600\\:d}`;
-        const realTotalM = `%{eif\\:mod((${realTotalSec})/60,60)\\:d\\:2}`;
-        const compressedSec = `%{eif\\:${prevCompSec}\\:d}`;
-
-        const startLabel = sessionStartStr || "????-??-?? ??\\:??";
-        const curDate = `%{localtime\\:%Y-%m-%d}`;
-        const curHM = `%{localtime\\:%H}\\:%{localtime\\:%M}`;
-
-        const overlayText =
-          `Work From ${startLabel} To ${curDate} ${curHM}` +
-          ` | Real Time ${realTotalH}h ${realTotalM}m` +
-          ` | Compressed ${compressedSec} sec`;
+        const watermarkFile = watermarkTextFile
+          ? this.escapeDrawtextFilePath(watermarkTextFile)
+          : "";
 
         const dt =
           `drawtext=font='Arial'` +
-          `:text='${overlayText}'` +
+          `:textfile='${watermarkFile}'` +
+          `:reload=1` +
           `:x=(w-text_w)/2:y=h-50:fontcolor=yellow:fontsize=22:box=1:boxcolor=black@0.8`;
 
         const vf = [
+          `settb=AVTB`,
+          `setpts=PTS-STARTPTS`,
           `mpdecimate=hi=${hi}:lo=${lo}:frac=${frac}`,
           dt,
-          `settb=AVTB`,
           `setpts=N/(${outputFps}*TB)`,
           `fps=${outputFps}:eof_action=pass`,
           `format=yuv420p`,
@@ -339,9 +500,12 @@ export class RecorderEngine extends EventEmitter {
           prevCompSec,
           prevActiveSec,
           sessionStartStr,
+          watermarkTextFile,
           outputFps,
-          note: "Uses wall-clock elapsed time (%{localtime:%s}) for real time, not output PTS",
-          note2: "fps filter changed to eof_action=pass and -vsync vfr to prevent frame-flood on gdigrab stalls",
+          totalFormula:
+            "app activity tracker: accepted frame OR recent input OR cursor movement",
+          compressedFormula: "ffmpeg progress frame/outputFps+previousCompressedSec",
+          frameFloodProtection: "fps eof_action=pass, vsync vfr",
         });
       }
       // No dedup fallback for video mode - mpdecimate only
@@ -1020,6 +1184,8 @@ export class RecorderEngine extends EventEmitter {
       this.currentPreviousCompressedSec = previousCompressedSec;
       this.currentPreviousActiveSec = previousActiveSec;
       this.currentSessionStartStr = sessionStartStr;
+      this.lastFfmpegProgressFrame = null;
+      const watermarkTextFile = this.prepareWatermarkTextFile();
       args = this.buildFfmpegArgs(
         outPattern,
         nextIndex,
@@ -1028,6 +1194,7 @@ export class RecorderEngine extends EventEmitter {
         previousCompressedSec,
         previousActiveSec,
         sessionStartStr,
+        watermarkTextFile,
       );
       this.logger.info("Spawning ffmpeg (video)", {
         args,
@@ -1075,6 +1242,9 @@ export class RecorderEngine extends EventEmitter {
       outputFps: this.outputFps,
       sessionLogPath: this.sessionLogPath,
     });
+    if (this.mode === "video") {
+      this.startActivityTracker();
+    }
     this.emit("started");
 
     try {
@@ -1112,6 +1282,9 @@ export class RecorderEngine extends EventEmitter {
       const imageRe =
         /Opening '(.+img_\d+\.(?:jpg|jpeg|png))(?:' for writing)?/g;
       const progress = this.parseFfmpegProgress(s);
+      if (progress.frame !== null) {
+        this.lastFfmpegProgressFrame = progress.frame;
+      }
       if (
         progress.frame !== null &&
         now - this.progressDiagLastAtMs >= FFMPEG_PROGRESS_DIAG_INTERVAL_MS
@@ -1259,12 +1432,29 @@ export class RecorderEngine extends EventEmitter {
 
     this.ff.on("close", (code) => {
       const closeAt = Date.now();
+      this.stopActivityTracker("ffmpeg-close");
       const processElapsedSec =
         this.ffmpegSpawnedAtMs > 0
           ? Math.max(0, (closeAt - this.ffmpegSpawnedAtMs) / 1000)
           : 0;
-      if (this.mode === "video" && processElapsedSec > 0) {
-        this.sessionRecordedActiveSec += processElapsedSec;
+      let acceptedFrameCount: number | null = null;
+      let producedCompressedSec: number | null = null;
+      if (this.mode === "video") {
+        const totalCompressedSec = this.getSegmentDurationTotalSec(
+          this.sessionSegments,
+        );
+        producedCompressedSec = Math.max(
+          0,
+          totalCompressedSec - this.currentPreviousCompressedSec,
+        );
+        const framesFromDuration =
+          producedCompressedSec > 0
+            ? Math.round(producedCompressedSec * this.outputFps)
+            : 0;
+        acceptedFrameCount = Math.max(
+          this.lastFfmpegProgressFrame ?? 0,
+          framesFromDuration,
+        );
       }
       this.lastFfmpegExitCode = code;
       if (code !== 0 && code !== null) {
@@ -1281,6 +1471,9 @@ export class RecorderEngine extends EventEmitter {
           code,
           pid: this.ff?.pid,
           elapsedSec: Math.round(processElapsedSec),
+          acceptedFrameCount,
+          producedCompressedSec,
+          progressFrame: this.lastFfmpegProgressFrame,
           sessionRecordedActiveSec: Math.round(this.sessionRecordedActiveSec),
           segmentsInMemory: this.segments.length,
           sessionSegmentsInMemory: this.sessionSegments.length,
@@ -1291,6 +1484,7 @@ export class RecorderEngine extends EventEmitter {
       this.writeSessionLog(
         `[SESSION PROCESS CLOSE] ${new Date().toISOString()} (code=${code})\n`,
       );
+      this.cleanupWatermarkTextFile();
       if (this.state !== "paused") {
         this.closeSessionLog("process-close");
       }

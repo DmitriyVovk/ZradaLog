@@ -1024,8 +1024,14 @@ app.whenReady().then(async () => {
   });
 
   // control messages from renderer (start/pause/resume/stop)
-  ipcMain.on("zrada:control", (_ev, action: string) => {
+  ipcMain.on("zrada:control", (ev, action: string) => {
     if (!recorder) return;
+    logger.info("Recorder control IPC received", {
+      action,
+      recorderState: recorder.getState(),
+      senderId: ev.sender.id,
+      senderUrl: ev.sender.getURL(),
+    });
     switch (action) {
       case "start": {
         try {

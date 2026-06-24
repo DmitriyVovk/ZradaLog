@@ -66,13 +66,24 @@ export const App: React.FC = () => {
   const clearLogs = () => setLogs([]);
 
   // Handlers passed to controls
-  const handleStartPauseToggle = () => {
+  const handleStartPauseToggle = (event: React.MouseEvent<HTMLButtonElement>) => {
     try {
       const api = (window as any).zradaControls;
       if (!api) return;
-      if (state === 'recording') api.pause?.();
-      else if (state === 'paused') api.resume?.();
-      else api.start?.();
+      const action = state === 'recording' ? 'pause' : state === 'paused' ? 'resume' : 'start';
+      (window as any).zradaLogger?.send?.('info', 'Recording control UI activated', {
+        action,
+        recorderState: state,
+        isTrusted: event.nativeEvent.isTrusted,
+        clickDetail: event.detail,
+        mouseButton: event.button,
+        screenX: event.screenX,
+        screenY: event.screenY,
+        documentVisibility: document.visibilityState,
+        documentHasFocus: document.hasFocus(),
+        activeElement: document.activeElement?.tagName ?? null,
+      });
+      api[action]?.();
     } catch (e) { /* ignore */ }
   };
   const handleStop = () => (window as any).zradaControls?.stop?.();

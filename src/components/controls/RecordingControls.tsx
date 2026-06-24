@@ -2,10 +2,10 @@ import React from 'react';
 
 export interface RecordingControlsProps {
   state: string;
-  onStart?: () => void;
+  onStart?: (event: React.MouseEvent<HTMLButtonElement>) => void;
   onPause?: () => void;
   onResume?: () => void;
-  onStop?: () => void;
+  onStop?: (event: React.MouseEvent<HTMLButtonElement>) => void;
 }
 
 const btnStyle: React.CSSProperties = { padding: '10px 14px', margin: 6, minWidth: 88 };
@@ -18,8 +18,8 @@ const RecordingControls: React.FC<RecordingControlsProps> = ({ state, onStart, o
     <div>
       <h2>Recording</h2>
       <div style={{display:'flex', flexWrap:'wrap', alignItems:'center'}}>
-        <button style={{...btnStyle, background: bg, color:'#fff', border:'none'}} onClick={onStart}>{label}</button>
-        <button style={btnStyle} onClick={onStop}>Stop</button>
+        <button type="button" style={{...btnStyle, background: bg, color:'#fff', border:'none'}} onClick={onStart}>{label}</button>
+        <button type="button" style={btnStyle} onClick={onStop}>Stop</button>
       </div>
       
       {/* Last-frame indicator moved to ModeControls */}
