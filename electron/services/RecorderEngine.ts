@@ -83,6 +83,9 @@ export class RecorderEngine extends EventEmitter {
   private lastSegmentSize: number | null = null;
   private lastFewSegmentSizes: number[] = [];
   private gdigrabErrorCount = 0;
+  private fatalCaptureError:
+    | { reason: string; at: string; stderr: string }
+    | null = null;
 
   private sessionLogPath: string | null = null;
   private lastSessionLogPath: string | null = null;
@@ -613,19 +616,17 @@ export class RecorderEngine extends EventEmitter {
     try {
       const ps = [
         "$ErrorActionPreference = 'SilentlyContinue'",
-        "$c = Get-Counter '\\Memory\\Committed Bytes','\\Memory\\Commit Limit','\\Memory\\Available MBytes','\\Paging File(_Total)\\% Usage'",
-        "$map = @{}",
-        "foreach ($s in $c.CounterSamples) { $map[$s.Path] = [double]$s.CookedValue }",
-        "$commitUsed = ($map.Keys | Where-Object { $_ -like '*\\memory\\committed bytes' } | Select-Object -First 1)",
-        "$commitLimit = ($map.Keys | Where-Object { $_ -like '*\\memory\\commit limit' } | Select-Object -First 1)",
-        "$avail = ($map.Keys | Where-Object { $_ -like '*\\memory\\available mbytes' } | Select-Object -First 1)",
-        "$page = ($map.Keys | Where-Object { $_ -like '*\\paging file(_total)\\% usage' } | Select-Object -First 1)",
-        "$committedBytes = $(if ($commitUsed) { $map[$commitUsed] } else { $null })",
-        "$commitLimitBytes = $(if ($commitLimit) { $map[$commitLimit] } else { $null })",
-        "$commitUsagePercent = $(if ($committedBytes -and $commitLimitBytes) { [math]::Round(($committedBytes / $commitLimitBytes) * 100, 2) } else { $null })",
+        "$src = @'\nusing System;\nusing System.Runtime.InteropServices;\npublic class ZradaMemoryStatusNative {\n  [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Auto)]\n  public class MEMORYSTATUSEX {\n    public uint dwLength;\n    public uint dwMemoryLoad;\n    public ulong ullTotalPhys;\n    public ulong ullAvailPhys;\n    public ulong ullTotalPageFile;\n    public ulong ullAvailPageFile;\n    public ulong ullTotalVirtual;\n    public ulong ullAvailVirtual;\n    public ulong ullAvailExtendedVirtual;\n    public MEMORYSTATUSEX() { dwLength = (uint)Marshal.SizeOf(typeof(MEMORYSTATUSEX)); }\n  }\n  [return: MarshalAs(UnmanagedType.Bool)]\n  [DllImport(\"kernel32.dll\", CharSet = CharSet.Auto, SetLastError = true)]\n  public static extern bool GlobalMemoryStatusEx([In, Out] MEMORYSTATUSEX lpBuffer);\n}\n'@",
+        "Add-Type $src",
+        "$m = New-Object ZradaMemoryStatusNative+MEMORYSTATUSEX",
+        "$ok = [ZradaMemoryStatusNative]::GlobalMemoryStatusEx($m)",
+        "$committedBytes = $(if ($ok) { [double]($m.ullTotalPageFile - $m.ullAvailPageFile) } else { $null })",
+        "$commitLimitBytes = $(if ($ok) { [double]$m.ullTotalPageFile } else { $null })",
+        "$commitUsagePercent = $(if ($committedBytes -ne $null -and $commitLimitBytes -gt 0) { [math]::Round(($committedBytes / $commitLimitBytes) * 100, 2) } else { $null })",
+        "$availableMBytes = $(if ($ok) { [math]::Round(([double]$m.ullAvailPhys / 1MB), 2) } else { $null })",
         "$top = Get-Process | Sort-Object PM -Descending | Select-Object -First 10 @{n='name';e={$_.ProcessName}},Id,@{n='privateBytes';e={$_.PM}},@{n='workingSetBytes';e={$_.WS}},@{n='pagedMemoryBytes';e={$_.PagedMemorySize64}},@{n='virtualMemoryBytes';e={$_.VirtualMemorySize64}}",
-        "$named = Get-Process | Where-Object { $_.ProcessName -match '^(ffmpeg|electron|ZradaLog|firefox|chrome|msedge|X2)$' } | Sort-Object PM -Descending | Select-Object @{n='name';e={$_.ProcessName}},Id,@{n='privateBytes';e={$_.PM}},@{n='workingSetBytes';e={$_.WS}},@{n='pagedMemoryBytes';e={$_.PagedMemorySize64}},@{n='virtualMemoryBytes';e={$_.VirtualMemorySize64}}",
-        "[pscustomobject]@{ counters = [pscustomobject]@{ committedBytes = $committedBytes; commitLimitBytes = $commitLimitBytes; commitUsagePercent = $commitUsagePercent; availableMBytes = $(if ($avail) { $map[$avail] } else { $null }); pagingFileUsagePercent = $(if ($page) { $map[$page] } else { $null }) }; topPrivateBytes = $top; namedProcesses = $named } | ConvertTo-Json -Compress -Depth 5",
+        "$named = Get-Process | Where-Object { $_.ProcessName -match '^(ffmpeg|electron|ZradaLog|firefox|chrome|msedge|X2|AltiumDesigner|Telegram)$' } | Sort-Object PM -Descending | Select-Object @{n='name';e={$_.ProcessName}},Id,@{n='privateBytes';e={$_.PM}},@{n='workingSetBytes';e={$_.WS}},@{n='pagedMemoryBytes';e={$_.PagedMemorySize64}},@{n='virtualMemoryBytes';e={$_.VirtualMemorySize64}}",
+        "[pscustomobject]@{ source = 'GlobalMemoryStatusEx'; counters = [pscustomobject]@{ committedBytes = $committedBytes; commitLimitBytes = $commitLimitBytes; commitUsagePercent = $commitUsagePercent; availableMBytes = $availableMBytes; pagingFileUsagePercent = $commitUsagePercent; freeVirtualBytes = $(if ($ok) { [double]$m.ullAvailVirtual } else { $null }); totalVirtualBytes = $(if ($ok) { [double]$m.ullTotalVirtual } else { $null }); totalPhysicalBytes = $(if ($ok) { [double]$m.ullTotalPhys } else { $null }); freePhysicalBytes = $(if ($ok) { [double]$m.ullAvailPhys } else { $null }); totalPageFileBytes = $(if ($ok) { [double]$m.ullTotalPageFile } else { $null }); freePageFileBytes = $(if ($ok) { [double]$m.ullAvailPageFile } else { $null }) }; topPrivateBytes = $top; namedProcesses = $named } | ConvertTo-Json -Compress -Depth 5",
       ].join("; ");
 
       const result = spawnSync(
@@ -644,11 +645,52 @@ export class RecorderEngine extends EventEmitter {
 
       return {
         basic,
-        windows: JSON.parse(result.stdout),
+        windows: JSON.parse(result.stdout.trim()),
       };
     } catch (e: any) {
       return { basic, windows: null, err: e?.message };
     }
+  }
+
+  private terminateFfmpegAfterFatalCaptureError(
+    reason: string,
+    stderr: string,
+    memoryDiagnostics?: unknown,
+  ) {
+    if (this.fatalCaptureError) return;
+    this.fatalCaptureError = {
+      reason,
+      at: new Date().toISOString(),
+      stderr,
+    };
+    this.writeSessionLog(
+      `[SESSION FATAL CAPTURE ERROR] ${this.fatalCaptureError.at} ${reason}\n`,
+    );
+    this.logger.error("Fatal capture error; terminating ffmpeg", {
+      reason,
+      pid: this.ff?.pid,
+      state: this.state,
+      sessionElapsedSec:
+        this.ffmpegSpawnedAtMs > 0
+          ? Math.round((Date.now() - this.ffmpegSpawnedAtMs) / 1000)
+          : null,
+      progressFrame: this.lastFfmpegProgressFrame,
+      memory: memoryDiagnostics ?? this.collectMemoryDiagnostics(),
+    });
+
+    try {
+      if (this.ff?.stdin?.writable) this.ff.stdin.write("q");
+    } catch (_) {}
+    try {
+      this.ff?.kill();
+    } catch (_) {}
+    try {
+      if (process.platform === "win32" && this.ff?.pid) {
+        spawnSync("taskkill", ["/PID", String(this.ff.pid), "/F"], {
+          windowsHide: true,
+        });
+      }
+    } catch (_) {}
   }
 
   private getCompletedSegmentDurationSec(nextIndex: number) {
@@ -980,6 +1022,7 @@ export class RecorderEngine extends EventEmitter {
     });
 
     const isResuming = this.state === "paused";
+    this.fatalCaptureError = null;
     if (!isResuming) {
       this.sessionSegments = [];
       this.sessionRecordedActiveSec = 0;
@@ -1313,13 +1356,19 @@ export class RecorderEngine extends EventEmitter {
       // Detect gdigrab errors early
       if (s.includes("desktop: Cannot allocate memory")) {
         this.gdigrabErrorCount++;
+        const memory = this.collectMemoryDiagnostics();
         this.logger.error("gdigrab memory allocation failed — potential frame-flood risk", {
           occurrenceCount: this.gdigrabErrorCount,
           sessionElapsedSec: this.ffmpegSpawnedAtMs > 0
             ? Math.round((now - this.ffmpegSpawnedAtMs) / 1000)
             : null,
-          memory: this.collectMemoryDiagnostics(),
+          memory,
         });
+        this.terminateFfmpegAfterFatalCaptureError(
+          "gdigrab desktop cannot allocate memory",
+          s,
+          memory,
+        );
       }
 
       while ((mVideo = videoRe.exec(s)) !== null) {
@@ -1456,19 +1505,24 @@ export class RecorderEngine extends EventEmitter {
           framesFromDuration,
         );
       }
-      this.lastFfmpegExitCode = code;
-      if (code !== 0 && code !== null) {
+      const effectiveCode =
+        this.fatalCaptureError && code === null ? -1 : code;
+      this.lastFfmpegExitCode = effectiveCode;
+      if (effectiveCode !== 0 && effectiveCode !== null) {
         this.lastFfmpegErrorTail = this.ffmpegLastStderr.slice(-15).join(" | ");
         // Log the last stderr lines to the main app log so errors are visible
         // without having to dig into the session log file.
         this.logger.warn("ffmpeg exited with error", {
-          code,
+          code: effectiveCode,
+          rawCode: code,
+          fatalCaptureError: this.fatalCaptureError,
           stderrTail: this.lastFfmpegErrorTail,
           memory: this.collectMemoryDiagnostics(),
         });
       } else {
         this.logger.info("ffmpeg exited", {
-          code,
+          code: effectiveCode,
+          rawCode: code,
           pid: this.ff?.pid,
           elapsedSec: Math.round(processElapsedSec),
           acceptedFrameCount,
